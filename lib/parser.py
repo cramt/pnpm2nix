@@ -72,17 +72,43 @@ def is_workspace_ref(spec: str) -> bool:
     return spec.startswith(("link:", "file:", "workspace:"))
 
 
-def normalize_dep_value(value: object) -> str:
-    """A snapshot's dependency value is the resolved key minus the dependency name.
+def is_alias_dep(dep_name: str, dep_value: str) -> bool:
+    """Detect npm aliases: the dep name differs from the resolved package name.
 
-    pnpm v9 stores deps as `{ "react": "18.2.0(scheduler@0.23.0)" }`. The full
-    snapshot key for that dep is `react@18.2.0(scheduler@0.23.0)`. We need to
-    return that full key so callers can look it up in `snapshots`.
+    Normal deps:   { "react": "18.2.0" }          → key = react@18.2.0
+    Alias deps:    { "h3-v2": "h3@2.0.1-rc.20" }  → key = h3@2.0.1-rc.20
 
-    Some entries are full version strings; some are resolution refs starting with
-    /, link:, file:, etc. We pass those through and let the consumer handle them.
+    In the lockfile, resolved version strings always start with a digit (semver).
+    Alias values start with a package name (letter or @), making them already a
+    full snapshot key reference.
+
+    Workspace protocols (link:, file:, workspace:) also start with a letter but
+    are NOT aliases — they reference local paths and need dep_name@ prepended.
     """
-    return str(value)
+    if not dep_value:
+        return False
+    if dep_value[0].isdigit():
+        return False
+    if dep_value.startswith(("link:", "file:", "workspace:")):
+        return False
+    return True
+
+
+def resolve_dep_key(dep_name: str, dep_value: object) -> tuple[str, str]:
+    """Resolve a snapshot dependency to (import_name, snapshot_key).
+
+    Returns the name used in `node_modules/` (may differ from the snapshot key's
+    package name for aliases) and the snapshot key to look up.
+    """
+    v = str(dep_value)
+    if is_alias_dep(dep_name, v):
+        # Alias: value is already the full key (e.g. "h3@2.0.1-rc.20").
+        # The dep is installed as dep_name in node_modules/ but resolves
+        # to a different package.
+        return dep_name, v
+    else:
+        # Normal: form key as dep_name@version.
+        return dep_name, f"{dep_name}@{v}"
 
 
 def main(lockfile_path: str) -> None:
@@ -151,9 +177,8 @@ def main(lockfile_path: str) -> None:
         deps_combined: dict[str, str] = {}
         for k in ("dependencies", "optionalDependencies"):
             for dep_name, dep_value in ((meta or {}).get(k) or {}).items():
-                # The dep value can be a full key suffix — we re-form the snapshot key.
-                v = normalize_dep_value(dep_value)
-                deps_combined[dep_name] = f"{dep_name}@{v}"
+                import_name, snapshot_key = resolve_dep_key(dep_name, dep_value)
+                deps_combined[import_name] = snapshot_key
 
         snapshots[key] = {
             "name": name,
@@ -180,7 +205,10 @@ def main(lockfile_path: str) -> None:
                 version_field = (dep_meta or {}).get("version")
                 if not version_field:
                     continue
-                importer_entry[dst][dep_name] = f"{dep_name}@{version_field}"
+                _import_name, snapshot_key = resolve_dep_key(
+                    dep_name, version_field
+                )
+                importer_entry[dst][dep_name] = snapshot_key
         importers[path] = importer_entry
 
     out = {

@@ -82,19 +82,24 @@ let
 
     # Top-level dep links — visible as `node_modules/<dep>` to the importer.
     # They're relative, pointing through .pnpm/ into the snapshot directories.
+    # For aliases, the symlink name is the alias but the target path uses the
+    # real package name from the snapshot.
     topLevelLinks = concatStringsSep "\n" (mapAttrsToList (depName: depKey: let
       isScoped = lib.hasPrefix "@" depName;
       relPrefix = if isScoped then "../.pnpm/" else ".pnpm/";
+      targetName = (parsed.snapshots.${depKey} or { name = depName; }).name;
     in ''
       mkdir -p "$out/node_modules/$(dirname '${depName}')"
-      ln -s "${relPrefix}${encodeKey depKey}/node_modules/${depName}" "$out/node_modules/${depName}"
+      ln -s "${relPrefix}${encodeKey depKey}/node_modules/${targetName}" "$out/node_modules/${depName}"
     '') registryDirect);
 
     # .bin entries use absolute paths into the farm so they resolve regardless
     # of where the importer's node_modules is consumed.
-    binLinkLines = concatStringsSep "\n" (mapAttrsToList (depName: depKey: ''
+    binLinkLines = concatStringsSep "\n" (mapAttrsToList (depName: depKey: let
+      targetName = (parsed.snapshots.${depKey} or { name = depName; }).name;
+    in ''
       populate_bin_for_pkg \
-        "${farm}/.pnpm/${encodeKey depKey}/node_modules/${depName}" \
+        "${farm}/.pnpm/${encodeKey depKey}/node_modules/${targetName}" \
         "$out/node_modules/.bin"
     '') registryDirect);
 

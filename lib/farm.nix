@@ -93,9 +93,13 @@ let
       # extra `..` to escape back up to `.pnpm/`.
       isScoped = lib.hasPrefix "@" depName;
       relPrefix = if isScoped then "../../../" else "../../";
+      # For aliases (e.g. h3-v2 → h3@2.0.1-rc.20), the dep is installed
+      # under `depName` but the target snapshot's directory uses the real
+      # package name. Look it up from the target snapshot.
+      targetName = nonWorkspaceSnapshots.${depKey}.name;
     in ''
       mkdir -p "$out/.pnpm/${enc}/node_modules/$(dirname '${depName}')"
-      ln -s "${relPrefix}${encodeKey depKey}/node_modules/${depName}" \
+      ln -s "${relPrefix}${encodeKey depKey}/node_modules/${targetName}" \
             "$out/.pnpm/${enc}/node_modules/${depName}"
     '') resolvedDeps);
 
