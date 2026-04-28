@@ -70,7 +70,11 @@ let
   # symlinks: .pnpm points to the shared farm, top-level deps point into .pnpm,
   # and .bin entries point into the farm's snapshot directories.
   mkImporterNodeModules = {name, topLevelDeps}: let
-    registryDirect = filterAttrs (_: k: !(isWorkspaceKey k)) topLevelDeps;
+    # Filter out workspace deps and deps whose snapshots were removed by
+    # platform filtering (e.g. fsevents on Linux).
+    registryDirect = filterAttrs (_: k:
+      !(isWorkspaceKey k) && parsed.snapshots ? ${k}
+    ) topLevelDeps;
     workspaceDirect = filterAttrs (_: k: isWorkspaceKey k) topLevelDeps;
 
     # Single symlink connecting this importer's node_modules/.pnpm to the

@@ -1,7 +1,7 @@
 # mkPnpmWorkspace — top-level entry point for building pnpm monorepo apps in Nix.
 #
 # Pipeline:
-#   lockfile → fetch → extract → farm → importer node_modules → per-app builds
+#   lockfile → platform filter → fetch → extract → farm (cells) → node_modules → app builds
 #
 # See ARCHITECTURE.md at the repo root for a diagram and detailed walkthrough.
 {
@@ -42,17 +42,47 @@
   # Stage 1: YAML lockfile → Nix attrset (IFD via Python/PyYAML)
   parsed = (callPackage ./lockfile.nix {}) pnpmLockYaml;
 
-  # Stage 2: one fetchurl per unique name@version
-  fetched = (callPackage ./fetch.nix {}) parsed;
+  # Stage 1.5: Platform filtering — drop packages and snapshots whose os/cpu
+  # fields don't match the build host. Prevents fetching and extracting ~292
+  # irrelevant tarballs on linux-x64 for a typical monorepo.
+  nixToNpmOs = {
+    "x86_64-linux" = "linux";   "aarch64-linux" = "linux";
+    "x86_64-darwin" = "darwin";  "aarch64-darwin" = "darwin";
+  };
+  nixToNpmCpu = {
+    "x86_64-linux" = "x64";     "aarch64-linux" = "arm64";
+    "x86_64-darwin" = "x64";    "aarch64-darwin" = "arm64";
+  };
+  hostSystem = stdenv.hostPlatform.system;
+  npmOs = nixToNpmOs.${hostSystem} or null;
+  npmCpu = nixToNpmCpu.${hostSystem} or null;
 
-  # Stage 3: one tar extraction + patchShebangs per package
-  extracted = (callPackage ./extract.nix {}) parsed fetched;
+  matchesPlatform = pkgId: let
+    spec = parsed.packages.${pkgId} or {};
+    osField = spec.os or null;
+    cpuField = spec.cpu or null;
+  in
+    (osField == null || npmOs == null || builtins.elem npmOs osField)
+    && (cpuField == null || npmCpu == null || builtins.elem npmCpu cpuField);
 
-  # Stage 4: single derivation builds the entire .pnpm/ layout using hardlinks
-  farm = (callPackage ./farm.nix {}) parsed extracted;
+  platformParsed = parsed // {
+    packages = filterAttrs (id: _: matchesPlatform id) parsed.packages;
+    snapshots = filterAttrs (_: snap:
+      (snap.workspace or false) || matchesPlatform snap.package
+    ) parsed.snapshots;
+  };
+
+  # Stage 2: one fetchurl per unique name@version (platform-filtered)
+  fetched = (callPackage ./fetch.nix {}) platformParsed;
+
+  # Stage 3: one tar extraction + patchShebangs per package (platform-filtered)
+  extracted = (callPackage ./extract.nix {}) platformParsed fetched;
+
+  # Stage 4: per-snapshot cell derivations + thin assembly symlink layer
+  farm = (callPackage ./farm.nix {}) platformParsed extracted;
 
   # Stage 5: per-importer node_modules (thin symlink layer over the farm)
-  nm = (callPackage ./nodeModules.nix {}) parsed farm;
+  nm = (callPackage ./nodeModules.nix {}) platformParsed farm;
   inherit (nm) mkImporterNodeModules isWorkspaceKey encodeKey;
 
   # ---------------------------------------------------------------------------
