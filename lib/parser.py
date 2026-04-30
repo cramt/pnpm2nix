@@ -24,9 +24,15 @@ Output shape:
       "optionalDeps": { "<name>": "<key>" }
     }
   },
-  "workspacePackages": [ "packages/foo", ... ]    # snapshot keys whose source
+  "workspacePackages": [ "packages/foo", ... ],    # snapshot keys whose source
                                                    # is a workspace path, not a
                                                    # tarball (link:/file:/workspace:)
+  "patchedDependencies": {             # pnpm patches to apply after extraction
+    "<name>@<version>": {
+      "path": "patches/foo@1.0.0.patch",
+      "hash": "abc123..."
+    }
+  }
 }
 
 The split between `packages` and `snapshots` mirrors the lockfile itself in v9:
@@ -211,19 +217,44 @@ def main(lockfile_path: str) -> None:
                 importer_entry[dst][dep_name] = snapshot_key
         importers[path] = importer_entry
 
+    # --- patchedDependencies --------------------------------------------------
+    # pnpm patches: the lockfile records which packages have patches and the
+    # relative path to each patch file. We emit this so the extract layer can
+    # apply them after tarball extraction.
+    #
+    # Lockfile shape:
+    #   patchedDependencies:
+    #     astro@6.1.10:
+    #       hash: 0ade1ff...
+    #       path: patches/astro@6.1.10.patch
+    raw_patched = data.get("patchedDependencies") or {}
+    patched_dependencies: dict[str, dict] = {}
+    for pkg_key, patch_meta in raw_patched.items():
+        if not patch_meta or not isinstance(patch_meta, dict):
+            continue
+        patch_path = patch_meta.get("path")
+        patch_hash = patch_meta.get("hash", "")
+        if patch_path:
+            patched_dependencies[pkg_key] = {
+                "path": patch_path,
+                "hash": patch_hash,
+            }
+
     out = {
         "lockfileVersion": lockfile_version,
         "packages": packages,
         "snapshots": snapshots,
         "importers": importers,
         "workspacePackages": sorted(set(workspace_packages)),
+        "patchedDependencies": patched_dependencies,
     }
     print(json.dumps(out, sort_keys=True, indent=2))
     print(
         f"// packages={len(packages)} "
         f"snapshots={len(snapshots)} "
         f"importers={len(importers)} "
-        f"workspaceRefs={len(workspace_packages)}",
+        f"workspaceRefs={len(workspace_packages)}"
+        f"{f' patches={len(patched_dependencies)}' if patched_dependencies else ''}",
         file=sys.stderr,
     )
 

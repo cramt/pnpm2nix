@@ -76,7 +76,8 @@
   fetched = (callPackage ./fetch.nix {}) platformParsed;
 
   # Stage 3: one tar extraction + patchShebangs per package (platform-filtered)
-  extracted = (callPackage ./extract.nix {}) platformParsed fetched;
+  # workspace is passed so extract can apply pnpm patches (patchedDependencies).
+  extracted = (callPackage ./extract.nix {}) platformParsed fetched workspace;
 
   # Stage 4: per-snapshot cell derivations + thin assembly symlink layer
   farm = (callPackage ./farm.nix {}) platformParsed extracted;
