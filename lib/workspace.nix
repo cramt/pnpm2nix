@@ -238,6 +238,13 @@
     appExtraNative = extraNativeBuildInputs ++ (app.extraNativeBuildInputs or []);
     script = app.script or "build";
     distDir = app.distDir or "dist";
+    # Workspace packages whose build script must run before the app build.
+    # Useful when a workspace package produces gitignored build artifacts
+    # (e.g. codegen, asset inlining) that the app's bundler needs to resolve.
+    preBuildPackages = app.preBuildPackages or [];
+    preBuildLines = concatStringsSep "\n" (map (pkg:
+      "pnpm --filter ./${pkg} run build"
+    ) preBuildPackages);
   in
     stdenv.mkDerivation {
       pname = app.name;
@@ -261,6 +268,7 @@
       buildPhase = ''
         runHook preBuild
         ${concatStringsSep "\n" (mapAttrsToList (k: v: ''export ${k}=${lib.escapeShellArg v}'') appBuildEnv)}
+        ${preBuildLines}
         pnpm --filter ./${app.path} run ${script}
         runHook postBuild
       '';
