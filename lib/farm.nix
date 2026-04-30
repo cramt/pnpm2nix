@@ -14,6 +14,10 @@
 #   3. Hardlink (`cp -al`) from staging into every snapshot position.
 #      This works because both source and target are under $out (same mount).
 #   4. Remove the staging area; file data persists via the hardlinks.
+#   5. Create a hoisted `.pnpm/node_modules/` directory with symlinks to one
+#      representative snapshot per package name. This matches pnpm's default
+#      `hoistPattern: ['*']` behavior and is required for TypeScript's
+#      ancestor-walking `@types` resolution to work from within the farm.
 #
 # Why not per-snapshot derivations?
 #   npm allows circular dependencies (A→B→C→A). Nix derivations can't
@@ -80,11 +84,37 @@ let
     ${depLinks}
   '') nonWorkspaceSnapshots);
 
+  # --- Stage 3: hoisted .pnpm/node_modules/ layer ---
+  # pnpm's default hoistPattern ['*'] creates a flat node_modules/ inside
+  # .pnpm/ containing one symlink per unique package name. This allows
+  # TypeScript's ancestor-walking @types resolution to find type packages
+  # that are not direct dependencies of a snapshot (e.g., @types/react for
+  # @react-google-maps/api which only declares @types/google.maps).
+  #
+  # For each unique package name, we pick one snapshot key and symlink:
+  #   .pnpm/node_modules/<name> → ../<encoded-key>/node_modules/<name>
+  #
+  # Collect { name → snapshotKey } mapping. Last-write-wins is fine; we just
+  # need one representative version per name.
+  nameToSnapshot = builtins.foldl' (acc: entry: acc // { ${entry.name} = entry.key; })
+    {} (mapAttrsToList (key: snap: { inherit key; inherit (snap) name; }) nonWorkspaceSnapshots);
+
+  hoistLines = concatStringsSep "\n" (mapAttrsToList (name: snapKey: let
+    isScoped = lib.hasPrefix "@" name;
+    relPrefix = if isScoped then "../../" else "../";
+    enc = encodeKey snapKey;
+  in ''
+    mkdir -p "$out/.pnpm/node_modules/$(dirname '${name}')"
+    ln -s "${relPrefix}${enc}/node_modules/${name}" \
+          "$out/.pnpm/node_modules/${name}"
+  '') nameToSnapshot);
+
 in
   runCommand "pnpm-farm" {
     passthru = {
       snapshotCount = builtins.length (builtins.attrNames nonWorkspaceSnapshots);
       packageCount = builtins.length usedPkgIds;
+      hoistedCount = builtins.length (builtins.attrNames nameToSnapshot);
     };
   } ''
     mkdir -p "$out/.pnpm" "$out/.p"
@@ -103,4 +133,9 @@ in
 
     # Stage 3: remove staging. Inodes persist via the hardlinks in stage 2.
     rm -rf "$out/.p"
+
+    # Stage 4: create hoisted .pnpm/node_modules/ layer for TypeScript @types
+    # resolution and other ancestor-walking module lookups.
+    mkdir -p "$out/.pnpm/node_modules"
+    ${hoistLines}
   ''
