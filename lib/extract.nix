@@ -24,7 +24,13 @@
     safeName = builtins.replaceStrings ["/"] ["+"] spec.name;
     patchInfo = patchedDeps.${key} or null;
     hasPatch = patchInfo != null;
-    patchFile = if hasPatch then workspaceSrc + "/${patchInfo.path}" else null;
+    # Nix store paths cannot contain '@'. Use builtins.path with a sanitized
+    # name so the patch file gets a legal store path while still pointing at the
+    # original file on disk.
+    patchFile = if hasPatch then builtins.path {
+      path = workspaceSrc + "/${patchInfo.path}";
+      name = builtins.replaceStrings ["@"] ["-"] (builtins.baseNameOf patchInfo.path);
+    } else null;
   in runCommand "pnpm-pkg-${safeName}-${spec.version}" {
     nativeBuildInputs = [ gnutar gzip nodejs ] ++ lib.optional hasPatch gitMinimal;
     inherit tarball;
