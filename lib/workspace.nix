@@ -25,6 +25,7 @@
   extraNativeBuildInputs ? [],
   extraNodeModuleSources ? [],
   noDevDependencies ? false,
+  appSrc ? null,
 } @ callerArgs: let
   resolvedPnpm =
     if callerArgs.pnpm != null
@@ -250,7 +251,7 @@
     stdenv.mkDerivation {
       pname = app.name;
       version = app.version or "0.0.0";
-      src = isolatedSrc app.name;
+      src = if appSrc != null then appSrc app.name else isolatedSrc app.name;
       nativeBuildInputs = [nodejs resolvedPnpm] ++ appExtraNative;
 
       # The node_modules tree is full of store-pointing symlinks. fixupPhase
