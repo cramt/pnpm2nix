@@ -264,6 +264,25 @@
       dontFixup = true;
       dontPatchShebangs = true;
 
+      # Sandbox-required pnpm settings via env vars. pnpm 11 made `.npmrc`
+      # auth/registry-only — non-auth settings must come from env or
+      # pnpm-workspace.yaml. Env vars work on both pnpm 10 and 11, so this
+      # is the portable place to put them. (The .npmrc above is kept for
+      # pnpm 10 compatibility and harmless under 11.)
+      #
+      # - verify_deps_before_run=false: pnpm 11 defaults to "install", which
+      #   re-runs install when running scripts. That hits the registry from
+      #   inside the sandbox and breaks the build.
+      # - manage_package_manager_versions=false: pnpm checks the
+      #   `packageManager` field and tries to switch versions otherwise.
+      # - side_effects_cache=false: pnpm's side-effects cache wants to write
+      #   into a directory that doesn't exist in the sandbox.
+      env = {
+        PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = "false";
+        PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS = "false";
+        PNPM_CONFIG_SIDE_EFFECTS_CACHE = "false";
+      };
+
       configurePhase = ''
         runHook preConfigure
         export HOME=$NIX_BUILD_TOP
