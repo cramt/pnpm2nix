@@ -55,12 +55,60 @@ let
     ];
     packages = [ "packages/ui" "packages/utils" ];
     nodejs = pkgs.nodejs_22;
-    pnpm = pkgs.pnpm;
+    # `pnpm` is optional — if omitted, pnpm2nix reads the workspace's
+    # package.json "packageManager" field and builds the matching version
+    # from npm using a hash from pnpm-versions.json.
   };
 in {
   packages.web = workspace.apps.web;
   packages.api = workspace.apps.api;
 }
+```
+
+## pnpm version handling
+
+pnpm2nix derives the pnpm version from the workspace's `package.json`
+`packageManager` field (the same field corepack reads). This keeps Nix
+builds, CI, and local development on the exact same pnpm version
+without anyone having to bump it in multiple places.
+
+```json
+{
+  "packageManager": "pnpm@10.5.2"
+}
+```
+
+Versions are looked up in `pnpm-versions.json` at the root of this repo,
+which maps `<version>` → npm tarball SRI integrity hash. The file is
+populated by:
+
+```bash
+scripts/update-pnpm-versions.sh
+```
+
+The script fetches the npm packument for pnpm and writes/updates every
+published version's integrity hash. It is idempotent — existing entries
+are preserved (npm tarballs are immutable), only newly-published
+versions are added. Run it whenever you bump pnpm and the new version
+isn't yet in the file (you'll get an actionable error from Nix telling
+you to run it).
+
+To override the auto-derived pnpm explicitly — e.g. for a one-off
+experiment or to use a pnpm with custom patches — pass `pnpm` to
+`mkPnpmWorkspace`, or use the `mkPnpm` helper:
+
+```nix
+let
+  pnpm2nix = inputs.pnpm2nix.lib.${system};
+in
+  pnpm2nix.mkPnpmWorkspace {
+    # ...
+    pnpm = pnpm2nix.mkPnpm {
+      version = "10.5.2";
+      hash = "sha512-...";
+      nodejs = pkgs.nodejs_22;
+    };
+  }
 ```
 
 ## API
@@ -86,9 +134,11 @@ pnpm2nix.mkPnpmWorkspace {
     }
   ];
   nodejs = pkgs.nodejs_22;           # Node.js to use
-  pnpm = pkgs.pnpm;                  # pnpm to use
 
   # Optional
+  pnpm = null;                       # Defaults to the pnpm version pinned by
+                                     # `packageManager` in workspace/package.json.
+                                     # Pass an explicit derivation to override.
   packages = [];                     # Shared workspace package paths
   pnpmLockYaml = workspace + "/pnpm-lock.yaml";
   buildEnv = {};                     # Env vars for all builds
@@ -110,6 +160,8 @@ pnpm2nix.mkPnpmWorkspace {
     "apps/my-app" = <derivation>; # Per-importer node_modules
   };
   pnpmStore = <derivation>;  # The shared .pnpm farm
+  pnpm = <derivation>;       # The pnpm used to build this workspace
+                             # (handy for `nix run` utility scripts)
   passthru = {
     parsed; fetched; extracted; farm; importerNodeModules;
   };

@@ -13,6 +13,7 @@
   gnutar,
   gzip,
   callPackage,
+  pnpmLib,
   pnpm ? null,
 }: {
   workspace,
@@ -27,12 +28,16 @@
   noDevDependencies ? false,
   appSrc ? null,
 } @ callerArgs: let
+  # Resolution order:
+  #   1. explicit `pnpm` arg to mkPnpmWorkspace (inner)
+  #   2. `pnpm` override passed at callPackage time (outer)
+  #   3. derive from the workspace's package.json "packageManager" field
   resolvedPnpm =
-    if callerArgs.pnpm != null
+    if (callerArgs.pnpm or null) != null
     then callerArgs.pnpm
     else if pnpm != null
     then pnpm
-    else throw "pnpm2nix: pass `pnpm` to mkPnpmWorkspace or override at callPackage time";
+    else pnpmLib.pnpmFromPackageManager {inherit workspace nodejs;};
 
   inherit (lib) mapAttrs filterAttrs concatStringsSep mapAttrsToList listToAttrs attrValues filter;
 
@@ -300,6 +305,10 @@ in {
   }) apps);
   nodeModules = importerNodeModules;
   pnpmStore = farm;
+  # The pnpm derivation actually used to build this workspace. Exposed so
+  # callers can reuse it for utility scripts (`nix run .#deps-update` etc.)
+  # without re-resolving the version themselves.
+  pnpm = resolvedPnpm;
 
   # Internal/debug handles. Not API surface.
   passthru = {
