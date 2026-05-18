@@ -20,6 +20,13 @@
   apps,
   packages ? [],
   pnpmLockYaml ? workspace + "/pnpm-lock.yaml",
+  # pnpm 11+ stores patchedDependencies paths in pnpm-workspace.yaml
+  # (only the hash lives in the lockfile). Pass it so the parser can
+  # reconstruct the path/hash pair. null is fine for pre-11 workspaces
+  # or workspaces with no patches.
+  pnpmWorkspaceYaml ?
+    let p = workspace + "/pnpm-workspace.yaml"; in
+    if builtins.pathExists p then p else null,
   nodejs,
   pnpm ? null,
   buildEnv ? {},
@@ -45,8 +52,9 @@
   # Pipeline stages. Each is lazy — only evaluated when consumed downstream.
   # ---------------------------------------------------------------------------
 
-  # Stage 1: YAML lockfile → Nix attrset (IFD via Python/PyYAML)
-  parsed = (callPackage ./lockfile.nix {}) pnpmLockYaml;
+  # Stage 1: YAML lockfile → Nix attrset (IFD via Python/PyYAML).
+  # pnpmWorkspaceYaml is needed for pnpm 11+ patchedDependencies paths.
+  parsed = (callPackage ./lockfile.nix {}) pnpmLockYaml pnpmWorkspaceYaml;
 
   # Stage 1.5: Platform filtering — drop packages and snapshots whose os/cpu
   # fields don't match the build host. Prevents fetching and extracting ~292

@@ -117,7 +117,7 @@ def resolve_dep_key(dep_name: str, dep_value: object) -> tuple[str, str]:
         return dep_name, f"{dep_name}@{v}"
 
 
-def main(lockfile_path: str) -> None:
+def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
     data = yaml.safe_load(Path(lockfile_path).read_text())
     if not isinstance(data, dict):
         raise SystemExit("pnpm-lock.yaml: expected a mapping at root")
@@ -218,22 +218,42 @@ def main(lockfile_path: str) -> None:
         importers[path] = importer_entry
 
     # --- patchedDependencies --------------------------------------------------
-    # pnpm patches: the lockfile records which packages have patches and the
-    # relative path to each patch file. We emit this so the extract layer can
-    # apply them after tarball extraction.
+    # pnpm patches: the lockfile records which packages have patches. We emit
+    # this so the extract layer can apply them after tarball extraction.
     #
-    # Lockfile shape:
-    #   patchedDependencies:
-    #     astro@6.1.10:
-    #       hash: 0ade1ff...
-    #       path: patches/astro@6.1.10.patch
+    # Two formats:
+    #   pnpm 10 (old) — path and hash both in the lockfile:
+    #     patchedDependencies:
+    #       astro@6.1.10:
+    #         hash: 0ade1ff...
+    #         path: patches/astro@6.1.10.patch
+    #
+    #   pnpm 11 (new) — lockfile carries only the hash; the path lives in
+    #   pnpm-workspace.yaml (where pnpm 11 expects patchedDependencies to
+    #   be declared):
+    #     # pnpm-lock.yaml
+    #     patchedDependencies:
+    #       astro@6.3.3: 08bc43e5...
+    #     # pnpm-workspace.yaml
+    #     patchedDependencies:
+    #       astro@6.3.3: patches/astro@6.3.3.patch
     raw_patched = data.get("patchedDependencies") or {}
+
+    workspace_patched: dict = {}
+    if workspace_yaml_path:
+        ws_data = yaml.safe_load(Path(workspace_yaml_path).read_text()) or {}
+        workspace_patched = ws_data.get("patchedDependencies") or {}
+
     patched_dependencies: dict[str, dict] = {}
     for pkg_key, patch_meta in raw_patched.items():
-        if not patch_meta or not isinstance(patch_meta, dict):
+        if isinstance(patch_meta, dict):
+            patch_path = patch_meta.get("path")
+            patch_hash = patch_meta.get("hash", "")
+        elif isinstance(patch_meta, str):
+            patch_hash = patch_meta
+            patch_path = workspace_patched.get(pkg_key)
+        else:
             continue
-        patch_path = patch_meta.get("path")
-        patch_hash = patch_meta.get("hash", "")
         if patch_path:
             patched_dependencies[pkg_key] = {
                 "path": patch_path,
@@ -260,4 +280,6 @@ def main(lockfile_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "pnpm-lock.yaml")
+    lockfile_arg = sys.argv[1] if len(sys.argv) > 1 else "pnpm-lock.yaml"
+    workspace_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    main(lockfile_arg, workspace_arg)

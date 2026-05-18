@@ -173,7 +173,9 @@ pnpm2nix.mkPnpmWorkspace {
 Each pipeline stage is exposed for advanced use or debugging:
 
 ```nix
-pnpm2nix.lockfile    # path → parsed attrset (IFD)
+pnpm2nix.lockfile    # path → workspaceYamlPath-or-null → parsed attrset (IFD)
+                     # workspaceYamlPath is needed for pnpm 11+ patchedDependencies
+                     # paths; pass null when unused.
 pnpm2nix.fetch       # parsed → { "pkg@ver" = <tarball>; ... }
 pnpm2nix.extract     # parsed → fetched → { "pkg@ver" = <extracted>; ... }
 pnpm2nix.farm        # parsed → extracted → <farm derivation>
