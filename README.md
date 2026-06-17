@@ -83,7 +83,7 @@ which maps `<version>` → npm tarball SRI integrity hash. The file is
 populated by:
 
 ```bash
-scripts/update-pnpm-versions.sh
+node scripts/update-pnpm-versions.mjs
 ```
 
 The script fetches the npm packument for pnpm and writes/updates every

@@ -7,7 +7,7 @@ in {
   # field, or build any specific pnpm version.
   #
   # Versions are looked up in ../pnpm-versions.json (refresh via
-  # scripts/update-pnpm-versions.sh).
+  # scripts/update-pnpm-versions.mjs).
   inherit (pnpmLib) mkPnpm parsePackageManager readPackageManager pnpmFromPackageManager;
 
   # Lower-level handles for non-workspace use or debugging. Each takes the

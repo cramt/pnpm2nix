@@ -26,7 +26,7 @@ jobs:
           persist-credentials: true
 
       - name: Run update script
-        run: scripts/update-pnpm-versions.sh
+        run: node scripts/update-pnpm-versions.mjs
 
       - name: Commit and push if changed
         run: |

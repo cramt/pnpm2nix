@@ -3,7 +3,7 @@
 #
 # Source: npm tarball (cross-platform, ~3MB). The tarball's SRI integrity
 # hash is read from ../pnpm-versions.json, which is maintained by
-# scripts/update-pnpm-versions.sh.
+# scripts/update-pnpm-versions.mjs.
 {
   lib,
   stdenv,
@@ -102,7 +102,7 @@
       throw ''
         pnpm2nix: pnpm version "${pm.version}" is not in pnpm-versions.json.
         Refresh the version list:
-          scripts/update-pnpm-versions.sh
+          node scripts/update-pnpm-versions.mjs
       ''
     else
       mkPnpm {
