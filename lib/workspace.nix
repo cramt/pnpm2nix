@@ -247,7 +247,14 @@
   # ---------------------------------------------------------------------------
 
   mkApp = app: let
-    appComponents = ["."] ++ packages ++ [app.path];
+    # Extra workspace importers whose node_modules must be set up in the
+    # sandbox even though they aren't built here. Use when the app's source
+    # (or its bundler/typechecker) pulls another importer's source into the
+    # program and so needs that importer's dependencies resolvable — e.g. a
+    # cross-app type consumer whose `tsc` compiles a sibling app's source via
+    # generated types. Their dirs must also be present in the app's `src`.
+    extraImporters = app.extraImporters or [];
+    appComponents = ["."] ++ packages ++ [app.path] ++ extraImporters;
     setupAll = concatStringsSep "\n" (map importerSetupLines appComponents);
     appBuildEnv = buildEnv // (app.buildEnv or {});
     appExtraNative = extraNativeBuildInputs ++ (app.extraNativeBuildInputs or []);
