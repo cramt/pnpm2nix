@@ -10,147 +10,146 @@ monorepo workspaces without running `pnpm install` at build time.
 pnpm-lock.yaml
       │
       ▼
-┌──────────┐   IFD (Python/PyYAML)
+┌──────────┐   IFD (Python/PyYAML) — also computes dep-graph SCCs
 │ lockfile  │   YAML → JSON → Nix attrset
 └────┬─────┘
-     │  parsed: { packages, snapshots, importers, workspacePackages }
+     │  parsed: { packages, snapshots, importers, cycles, ... }
      ▼
 ┌──────────┐   one fetchurl per name@version
-│  fetch    │   ~2,042 derivations (after platform filtering)
+│  fetch    │   ~2,800 derivations (after platform filtering)
 └────┬─────┘
      │  fetched: { "react@18.2.0" = /nix/store/...-react-18.2.0.tgz; ... }
      ▼
 ┌──────────┐   one runCommand per package (tar + patchShebangs)
-│ extract   │   ~2,042 derivations
+│ extract   │   ~2,800 derivations
 └────┬─────┘
      │  extracted: { "react@18.2.0" = /nix/store/...-pnpm-pkg-react-18.2.0/; ... }
      ▼
-┌──────────┐   ★ SINGLE derivation — the key optimization
-│   farm    │   platform filter → hardlink staging → relative dep symlinks
+┌──────────┐   ★ one derivation per snapshot ("cell"), grouped by SCC
+│  cells    │   package files + dep symlinks; absolute links between cells
 └────┬─────┘
-     │  farm: /nix/store/...-pnpm-farm/.pnpm/<key>/node_modules/<pkg>/
+     │  cells: { "react@18.2.0" = /nix/store/...-pnpm-cell-react-18.2.0/; ... }
+     ▼
+┌──────────┐   pure-symlink layers: .pnpm/<key> → <cell>/<key>
+│ compose   │   one per importer (pruned to its closure) + one full farm
+└────┬─────┘
+     │  builds in ~1s; the only layer that rebuilds on every lockfile change
      ▼
 ┌──────────────┐   one tiny derivation per importer (symlinks only)
-│ nodeModules   │   20 derivations (root + apps + packages)
+│ nodeModules   │   ~29 derivations (root + apps + packages)
 └────┬─────────┘
-     │  importerNodeModules: { "." = ...; "apps/foo" = ...; }
      ▼
 ┌──────────┐   one stdenv.mkDerivation per app
-│ workspace │   8 derivations (example monorepo)
+│ workspace │   12 derivations (example monorepo)
 └──────────┘
-     │  { apps.foo = /nix/store/...-foo/; ... }
 ```
 
-## The Farm: Platform Filtering + Hardlink Staging
+## Cells: Per-Snapshot Derivations
 
-The farm is the core innovation. Previous versions used two intermediate
-stages (snapshot + shared farm), each copying all package files — resulting
-in ~3× the total package data written to disk. The new farm collapses this
-into a single derivation with ~1× writes.
-
-### Platform Filtering
-
-Many npm packages ship platform-specific native binaries (esbuild, rollup,
-sharp, workerd, turbo, etc.). A typical lockfile contains variants for every
-platform: linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64, etc.
-
-The lockfile's `packages` section carries `os` and `cpu` arrays on these
-entries. The farm maps `stdenv.hostPlatform.system` to npm's os/cpu names
-and filters out snapshots whose package doesn't match.
-
-For a monorepo with 2,334 packages, building on linux-x64:
-- 320 packages have os/cpu restrictions
-- 292 are for other platforms (darwin, windows, android, etc.)
-- After filtering: 2,042 packages, 2,066 snapshots
-- Farm size drops from ~5.9 GB to ~2.5 GB (~58% reduction)
-
-Nix laziness handles the rest: since `fetch` and `extract` produce attrsets
-of derivations, any packages not referenced by the filtered farm are simply
-never built. No changes needed to the fetch/extract layers.
-
-### Why We Can't Just Symlink
-
-Node.js uses `realpath()` to resolve the actual filesystem location of a
-module, then walks **up** from that location looking for `node_modules/`
-directories. If we symlinked package directories to Nix store paths,
-`realpath()` would jump into `/nix/store/xxx-extracted/`, and walk-up
-resolution would look for `node_modules/` inside the store — failing to
-find the dep symlinks that sit alongside the package in `.pnpm/`.
-
-The package files must physically exist at their position within the
-`.pnpm/<key>/node_modules/<name>/` tree. Hardlinks achieve this without
-duplicating data.
-
-### The Three Stages
+Each snapshot gets its own derivation with the layout:
 
 ```
-$out/
-├── .p/                          ← staging area (temporary)
-│   ├── react@18.2.0/           ← real copy from store
-│   ├── @babel+core@7.24.0/     ← real copy from store
-│   └── ...                     ← 2,334 packages
-│
-└── .pnpm/                       ← final layout
-    ├── react@18.2.0/
-    │   └── node_modules/
-    │       ├── react/           ← hardlinks to .p/react@18.2.0/*
-    │       └── scheduler → ../../scheduler@0.23.0/node_modules/scheduler
-    │
-    └── react@18.2.0(react-dom@18.2.0)/
-        └── node_modules/
-            ├── react/           ← hardlinks to SAME inodes as above
-            └── react-dom → ../../react-dom@18.2.0(...)/node_modules/react-dom
+/nix/store/...-pnpm-cell-react-18.2.0/
+├── react@18.2.0/
+│   └── node_modules/
+│       ├── react/            ← package files, copied from extract
+│       └── scheduler → /nix/store/...-pnpm-cell-scheduler-0.23.0/scheduler@0.23.0/node_modules/scheduler
+└── node_modules → /build/.p2n-hoist          (hoist fallback, see below)
 ```
 
-**Stage 1** — Copy each unique package from the Nix store into `$out/.p/`.
-This is the only real file copy. We `chmod -R u+w` so the staging area
-is writable (needed for cleanup in stage 3).
+### Why absolute symlinks between cells work
 
-**Stage 2** — For each snapshot, `cp -al` (hardlink) from the staging area
-into `$out/.pnpm/<key>/node_modules/<name>/`. Since both source and target
-are under `$out`, they're on the same filesystem — hardlinks work. Then
-create the relative dep symlinks.
+Node resolves modules by `realpath()`ing a file, then walking **up** from
+that location looking for `node_modules/` directories. A file in cell A
+realpaths to `/nix/store/…-cell-A/<enc>/node_modules/<pkg>/…`; the walk-up
+finds cell A's own `node_modules/`, whose dep symlinks point (absolutely) at
+other cells' store paths. Following one lands in the dep's cell, where the
+same invariant holds recursively.
 
-**Stage 3** — `rm -rf $out/.p`. The file inodes persist because the
-hardlinks in `.pnpm/` still reference them. Only directory entries are freed.
+*Relative* links across cells would instead resolve against `/nix/store/`
+and dangle — that constraint is what previously forced a monolithic farm
+(one derivation copying every package into a shared tree, fully rebuilt on
+any lockfile change).
 
-### Disk I/O Comparison
+### Cycles: SCC condensation
 
-| Approach | Real file copies | Derivation count |
-|----------|-----------------|-----------------|
-| Old (snapshot + farm) | ~3× package data | 2,358 snapshots + 1 farm |
-| New (hardlink farm) | ~1× package data | 1 farm |
+npm allows circular dependencies (`browserslist ↔ update-browserslist-db`);
+Nix derivations can't reference each other cyclically. The parser computes
+the strongly connected components of the snapshot dep graph (iterative
+Tarjan) and emits the non-trivial ones as `parsed.cycles`. All members of a
+cycle share one cell and link to each other *relatively* (they're physically
+co-located, so relative links resolve within the cell). The SCC condensation
+is a DAG, so absolute inter-cell references always terminate.
 
-For a monorepo with ~2,300 packages totaling ~1.5 GB of extracted data,
-this saves ~3 GB of disk writes and eliminates 2,358 derivation builds
-(each with Nix sandbox setup overhead).
+Real lockfiles have a handful of tiny cycles — the profiled monorepo has 10,
+sized 2–6 members (babel core/helpers, es-abstract cluster, pg ↔ pg-pool).
 
-## Relative Symlinks: Avoiding Hash Cycles
+### Caching behavior
 
-Dependency links between snapshots use **relative** paths:
+Bumping a dependency rebuilds:
+- its fetch + extract + cell (one small package copy each),
+- the cells of its reverse-dependency ancestors (their symlink targets
+  changed, so their hashes changed),
+- the compose layers whose closure contains it (pure symlinks, ~1s).
+
+Everything else stays cached forever. Cells rebuild in parallel and each
+copies exactly one package, so even a worst-case bump (a package like
+`tslib` with ~340 transitive dependents) moves a few hundred MB, not the
+whole farm.
+
+## Compose Layers
+
+A compose layer is a derivation of nothing but symlinks:
 
 ```
-.pnpm/<keyA>/node_modules/<depB> → ../../<keyB>/node_modules/<depB>
+$out/.pnpm/
+├── react@18.2.0 → /nix/store/...-pnpm-cell-react-18.2.0/react@18.2.0
+├── ...one per snapshot in scope...
+└── node_modules/                 ← hoist: one symlink per unique package name
+    └── react → ../react@18.2.0/node_modules/react
 ```
 
-This is critical. If we used absolute Nix store paths, snapshot A's output
-would contain snapshot B's hash, and B might contain A's hash (circular
-deps like `browserslist ↔ update-browserslist-db`). This creates an
-infinite recursion during Nix evaluation.
+**Each importer gets its own compose layer, pruned to the transitive closure
+of its top-level deps** (computed with `builtins.genericClosure`). This is
+what makes caching *per-app*: a lockfile change that doesn't touch an app's
+closure leaves that app's compose — and therefore its node_modules and its
+build — fully cached. In the profiled monorepo, ~45% of snapshots are
+exclusive to a single app.
 
-Relative paths break the cycle: snapshot A's content doesn't reference B's
-hash at all. The paths only resolve correctly when all snapshots are
-co-located under a shared `.pnpm/` directory — which is exactly what the
-farm provides.
+The classic full farm (every snapshot) is still exposed as `pnpmStore`.
 
-### Scoped Package Depth
+## The Hoist Fallback
 
-Unscoped packages sit at `.pnpm/<key>/node_modules/<name>`, so the
-symlink needs `../../<depKey>/...` (two levels up: past `<name>`, past
-`node_modules`).
+pnpm's default `hoistPattern: ['*']` gives every package a last-resort
+lookup at `.pnpm/node_modules/` for dependencies it uses but never declared.
+This is load-bearing in the wild: `nitro-opentelemetry` requires
+`nitropack/kit` at runtime without declaring it, TypeScript resolves
+`@types/*` for transitive deps by ancestor-walking, etc. In the monolithic
+farm this worked by physical co-location; a cell's walk-up can't reach any
+compose layer.
 
-Scoped packages sit at `.pnpm/<key>/node_modules/@scope/<name>`, one
-level deeper, so the symlink needs `../../../<depKey>/...`.
+Instead, every cell root carries a **dangling symlink**:
+
+```
+<cell>/node_modules → /build/.p2n-hoist
+```
+
+Node's walk-up from `<cell>/<enc>/node_modules/<pkg>/…` consults
+`<cell>/node_modules/` right after the snapshot's declared deps. Inside an
+app build sandbox, `workspace.nix` materializes `/build/.p2n-hoist` as a
+symlink to that app's hoist compose (`.pnpm/node_modules/` over everything
+reachable from every importer set up in the sandbox).
+
+Properties:
+- The link contains **no store path**, so cells stay byte-identical across
+  lockfile changes — no rebuild cascade through the fallback.
+- Each app resolves hoisted names against its own closure — pnpm's
+  global-hoist semantics, scoped per app.
+- Outside a sandbox the link dangles, which means "no hoist" — the same as
+  pnpm with hoisting disabled.
+- Assumes the standard sandbox build dir `/build` (Nix's default
+  `build-dir`/`sandbox-build-dir`). Non-sandboxed builds degrade to
+  "no hoist".
 
 ## Importer Node Modules
 
@@ -159,39 +158,32 @@ containing only symlinks:
 
 ```
 node_modules/
-├── .pnpm → /nix/store/...-pnpm-farm/.pnpm     (into the shared farm)
-├── react → .pnpm/<key>/node_modules/react       (relative, through .pnpm)
-├── @repo/utils → ../packages/utils              (workspace dep, relative)
+├── .pnpm → /nix/store/...-pnpm-farm-<importer>/.pnpm   (its pruned compose)
+├── react → .pnpm/<key>/node_modules/react              (relative, through .pnpm)
 └── .bin/
-    ├── tsc → /nix/store/...-pnpm-farm/.pnpm/<key>/.../tsc   (absolute)
-    └── vite → /nix/store/...-pnpm-farm/.pnpm/<key>/.../vite  (absolute)
+    └── vite → /nix/store/...-pnpm-farm-<importer>/.pnpm/<key>/.../vite  (absolute)
 ```
 
-- **`.pnpm`**: symlink to the farm. Walk-up resolution from inside
-  `.pnpm/` works because Node follows the symlink into the farm.
-- **Top-level deps**: relative symlinks through `.pnpm/` into snapshot
-  directories.
-- **Workspace deps**: relative symlinks to the source tree (wired up
-  during the app build, not in the importer derivation). Scoped workspace
-  deps (e.g. `@repo/logging`) need an extra `..` because the symlink sits
-  one directory deeper (`node_modules/@scope/name` vs `node_modules/name`).
-- **`.bin/`**: absolute symlinks into the farm. Bin scripts need absolute
-  paths so `realpath` stays within the farm's `.pnpm/` tree for correct
-  walk-up resolution.
+Workspace deps (`link:`/`file:`/`workspace:`) are wired up as relative
+symlinks to the source tree during the app build, not here.
 
 ## App Build Flow
 
 Each app's `stdenv.mkDerivation`:
 
 1. **Source isolation**: `lib.fileset.difference` excludes other apps'
-   directories from the source tree. Touching app B doesn't invalidate
-   app A's build.
+   directories from the source tree — touching app B doesn't invalidate
+   app A's build — and `pnpm-lock.yaml` itself, which is consumed at eval
+   time only. Without that exclusion every lockfile change would rebuild
+   every app through `src`, defeating per-app dependency caching. Custom
+   `appSrc` filters must exclude the lockfile themselves to get the same
+   benefit.
 
 2. **Configure phase**:
+   - Points `/build/.p2n-hoist` at the app's hoist compose
    - Injects `.npmrc` with sandbox-required settings
    - For each importer (root + packages + this app):
      - `cp -aT` the importer node_modules (copies symlinks, not data)
-     - `chmod -R u+w` (only affects directory entries, not farm)
      - Creates workspace dep symlinks (relative to source tree)
 
 3. **Build phase**: `pnpm --filter ./<app> run build`
@@ -206,38 +198,32 @@ The Python parser (`lib/parser.py`) converts `pnpm-lock.yaml` v9 into:
 {
   "packages": {
     "<name>@<version>": {
-      "name": "react",
-      "version": "18.2.0",
+      "name": "react", "version": "18.2.0",
       "url": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
-      "integrity": "sha512-...",
-      "hasBin": false,
-      "os": ["linux"],
-      "cpu": ["x64"]
+      "integrity": "sha512-...", "hasBin": false,
+      "os": ["linux"], "cpu": ["x64"]
     }
   },
   "snapshots": {
     "<name>@<version>(<peers>)": {
-      "name": "react",
-      "version": "18.2.0",
-      "package": "react@18.2.0",
-      "workspace": false,
-      "deps": { "<depName>": "<depKey>" },
+      "name": "react", "version": "18.2.0", "package": "react@18.2.0",
+      "workspace": false, "deps": { "<depName>": "<depKey>" },
       "optional": false
     }
   },
   "importers": {
-    ".": { "deps": {}, "devDeps": {}, "optionalDeps": {} },
-    "apps/foo": { "deps": {}, "devDeps": {}, "optionalDeps": {} }
+    ".": { "deps": {}, "devDeps": {}, "optionalDeps": {} }
   },
-  "workspacePackages": ["@repo/utils@link:../../packages/utils"]
+  "workspacePackages": ["@repo/utils@link:../../packages/utils"],
+  "cycles": [ ["browserslist@4.28.4", "update-browserslist-db@1.2.3(...)"] ],
+  "patchedDependencies": { "<name>@<version>": { "path": "...", "hash": "..." } }
 }
 ```
 
 **packages vs. snapshots**: A package is `react@18.2.0` — one tarball.
 A snapshot is `react@18.2.0(react-dom@18.2.0)` — a specific peer
 resolution. Two snapshots can share the same package (tarball) but have
-different dependency graphs. This split means a peer-dep change only
-rebuilds the affected snapshots, not the fetch/extract layers.
+different dependency graphs.
 
 ## Key Encoding
 
@@ -248,7 +234,7 @@ peer nesting). `lib/encode.nix` mirrors pnpm's `depPathToFilename`:
 - If result exceeds 120 chars: truncate to 93 chars + `_` + 26-char
   sha256 prefix
 
-This encoding is used as the directory name under `.pnpm/`.
+This encoding is used as the directory name under `.pnpm/` and inside cells.
 
 ## API
 
@@ -264,7 +250,7 @@ pnpm2nix.mkPnpmWorkspace {
   ];
   packages = [ "packages/utils" "packages/ui" ];  # shared workspace packages
   nodejs = pkgs.nodejs_22;
-  pnpm = pkgs.pnpm;
+  pnpm = pkgs.pnpm;              # optional; defaults from packageManager field
   buildEnv = { API_KEY = "..."; };                 # env vars for all builds
   extraNodeModuleSources = [                       # injected files
     { name = ".npmrc"; value = pkgs.writeText "npmrc" "..."; }
@@ -279,8 +265,9 @@ Returns:
 {
   apps = { foo = <derivation>; bar = <derivation>; };
   nodeModules = { "." = <derivation>; "apps/foo" = <derivation>; ... };
-  pnpmStore = <derivation>;   # the farm
-  passthru = { parsed; fetched; extracted; farm; importerNodeModules; };
+  pnpmStore = <derivation>;   # full compose farm over every snapshot
+  pnpm = <derivation>;        # the resolved pnpm
+  passthru = { parsed; fetched; extracted; farmLib; importerNodeModules; farm; };
 }
 ```
 
@@ -292,8 +279,8 @@ For non-workspace use or debugging:
 pnpm2nix.lockfile  # pnpmLockYaml → parsed
 pnpm2nix.fetch     # parsed → fetched
 pnpm2nix.extract   # parsed → fetched → extracted
-pnpm2nix.farm      # parsed → extracted → farm
-pnpm2nix.nodeModules  # parsed → farm → { mkImporterNodeModules, ... }
+pnpm2nix.farm      # parsed → extracted → { cells, compose, composeFor, closureFor, ... }
+pnpm2nix.nodeModules  # parsed → farmLib → { mkImporterNodeModules, ... }
 ```
 
 ## Known Limitations
@@ -304,9 +291,11 @@ pnpm2nix.nodeModules  # parsed → farm → { mkImporterNodeModules, ... }
    honored. Packages that need native binaries from postinstall will have
    broken binaries.
 
-2. **Monolithic farm rebuild**: Any lockfile change that adds, removes, or
-   modifies a package rebuilds the entire farm derivation. Individual
-   fetch/extract derivations are cached, but the farm is all-or-nothing.
+2. **Reverse-dependency cascade**: bumping a package rebuilds the cells of
+   everything that transitively depends on it (absolute symlinks embed the
+   dep cell's hash). Each rebuild is one small package copy and they run in
+   parallel, but a very popular leaf (tslib, ms, debug) touches a few
+   hundred cells.
 
 3. **IFD cold start**: The lockfile parser uses Import From Derivation
    (Python + PyYAML). On a fresh machine, the first `nix eval` must build
@@ -315,3 +304,6 @@ pnpm2nix.nodeModules  # parsed → farm → { mkImporterNodeModules, ... }
 4. **Git/tarball-by-path dependencies**: Only registry tarballs with
    `integrity` hashes are supported. Git dependencies and `tarball:`
    resolutions without integrity are skipped.
+
+5. **Hoist fallback needs the sandbox**: the `/build/.p2n-hoist` mechanism
+   assumes builds run in the standard Nix sandbox (build dir `/build`).

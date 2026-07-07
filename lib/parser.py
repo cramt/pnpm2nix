@@ -27,6 +27,10 @@ Output shape:
   "workspacePackages": [ "packages/foo", ... ],    # snapshot keys whose source
                                                    # is a workspace path, not a
                                                    # tarball (link:/file:/workspace:)
+  "cycles": [ ["a@1.0.0", "b@2.0.0"], ... ],       # non-trivial SCCs of the
+                                                   # snapshot dep graph; snapshots
+                                                   # in a cycle must share one
+                                                   # farm cell derivation
   "patchedDependencies": {             # pnpm patches to apply after extraction
     "<name>@<version>": {
       "path": "patches/foo@1.0.0.patch",
@@ -115,6 +119,76 @@ def resolve_dep_key(dep_name: str, dep_value: object) -> tuple[str, str]:
     else:
         # Normal: form key as dep_name@version.
         return dep_name, f"{dep_name}@{v}"
+
+
+def find_cycles(snapshots: dict[str, dict]) -> list[list[str]]:
+    """Non-trivial strongly connected components of the snapshot dep graph.
+
+    npm allows circular dependencies (browserslist ↔ update-browserslist-db).
+    Nix derivations can't reference each other cyclically, so the farm layer
+    builds one derivation per SCC ("cell"): cycle members are co-located and
+    linked relatively; everything across cells links absolutely. Emitting only
+    the non-trivial SCCs keeps the JSON small — every other snapshot is its
+    own singleton cell by definition.
+
+    Iterative Tarjan — dep chains in real lockfiles comfortably exceed
+    Python's recursion limit.
+    """
+    keys = [k for k, s in snapshots.items() if not s.get("workspace")]
+    keyset = set(keys)
+    adj = {
+        k: [d for d in snapshots[k]["deps"].values() if d in keyset]
+        for k in keys
+    }
+
+    index: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    counter = 0
+    cycles: list[list[str]] = []
+
+    for root in keys:
+        if root in index:
+            continue
+        # Each work item is (node, iterator over remaining deps).
+        work = [(root, iter(adj[root]))]
+        index[root] = lowlink[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for dep in it:
+                if dep not in index:
+                    index[dep] = lowlink[dep] = counter
+                    counter += 1
+                    stack.append(dep)
+                    on_stack.add(dep)
+                    work.append((dep, iter(adj[dep])))
+                    advanced = True
+                    break
+                elif dep in on_stack:
+                    lowlink[node] = min(lowlink[node], index[dep])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[node])
+            if lowlink[node] == index[node]:
+                scc = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    scc.append(member)
+                    if member == node:
+                        break
+                if len(scc) > 1:
+                    cycles.append(sorted(scc))
+
+    return sorted(cycles)
 
 
 def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
@@ -260,6 +334,8 @@ def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
                 "hash": patch_hash,
             }
 
+    cycles = find_cycles(snapshots)
+
     out = {
         "lockfileVersion": lockfile_version,
         "packages": packages,
@@ -267,13 +343,15 @@ def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
         "importers": importers,
         "workspacePackages": sorted(set(workspace_packages)),
         "patchedDependencies": patched_dependencies,
+        "cycles": cycles,
     }
     print(json.dumps(out, sort_keys=True, indent=2))
     print(
         f"// packages={len(packages)} "
         f"snapshots={len(snapshots)} "
         f"importers={len(importers)} "
-        f"workspaceRefs={len(workspace_packages)}"
+        f"workspaceRefs={len(workspace_packages)} "
+        f"cycles={len(cycles)}"
         f"{f' patches={len(patched_dependencies)}' if patched_dependencies else ''}",
         file=sys.stderr,
     )

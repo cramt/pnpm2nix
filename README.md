@@ -18,13 +18,11 @@ primitives (`fetchurl`, `runCommand`, hardlinks, symlinks).
 - **Platform filtering.** Native binaries for foreign platforms (e.g.
   `@esbuild/win32-x64` on a linux build) are automatically excluded.
   Cuts the store size roughly in half for typical monorepos.
-- **Hardlink staging.** When multiple snapshots share a package (peer
-  resolution variants), files are hardlinked rather than copied. The
-  entire `.pnpm/` tree is a single derivation — no per-snapshot
-  intermediates.
-- **Granular caching.** Fetch and extract derivations are keyed by
-  `name@version`. Changing a peer dep rebuilds only the farm layout,
-  not the download/extraction layers.
+- **Per-dependency caching.** Every snapshot is its own derivation
+  ("cell"); the shared `.pnpm/` view is a pure-symlink compose layer per
+  app, pruned to that app's dependency closure. Bumping a dep rebuilds
+  the affected cells and the apps whose closure actually changed —
+  nothing else.
 - **Source isolation.** Each app build only sees its own source tree.
   Touching app B doesn't invalidate app A's cache.
 
@@ -159,11 +157,11 @@ pnpm2nix.mkPnpmWorkspace {
     "." = <derivation>;           # Root node_modules
     "apps/my-app" = <derivation>; # Per-importer node_modules
   };
-  pnpmStore = <derivation>;  # The shared .pnpm farm
+  pnpmStore = <derivation>;  # Full compose farm over every snapshot
   pnpm = <derivation>;       # The pnpm used to build this workspace
                              # (handy for `nix run` utility scripts)
   passthru = {
-    parsed; fetched; extracted; farm; importerNodeModules;
+    parsed; fetched; extracted; farmLib; importerNodeModules; farm;
   };
 }
 ```
@@ -178,8 +176,8 @@ pnpm2nix.lockfile    # path → workspaceYamlPath-or-null → parsed attrset (IF
                      # paths; pass null when unused.
 pnpm2nix.fetch       # parsed → { "pkg@ver" = <tarball>; ... }
 pnpm2nix.extract     # parsed → fetched → { "pkg@ver" = <extracted>; ... }
-pnpm2nix.farm        # parsed → extracted → <farm derivation>
-pnpm2nix.nodeModules # parsed → farm → { mkImporterNodeModules, ... }
+pnpm2nix.farm        # parsed → extracted → { cells, compose, composeFor, ... }
+pnpm2nix.nodeModules # parsed → farmLib → { mkImporterNodeModules, ... }
 ```
 
 ## Pipeline
@@ -197,8 +195,11 @@ pnpm-lock.yaml
  [extract]      Untar + patchShebangs per package
       |
       v
-   [farm]       Single derivation: platform filter, hardlink staging,
-      |         relative dep symlinks. This IS the .pnpm/ virtual store.
+  [cells]       One derivation per snapshot (dep cycles share a cell);
+      |         package files + absolute symlinks to dep cells.
+      v
+ [compose]      Pure-symlink .pnpm/ views: one per importer, pruned to
+      |         its dependency closure. Rebuilds in ~1s.
       v
 [nodeModules]   Per-importer symlink layers (tiny, cheap to rebuild)
       |
@@ -240,13 +241,18 @@ Unknown systems fall back to including everything (no filtering).
   compile native code in postinstall will not.
 - **Git/tarball dependencies** without integrity hashes are skipped.
   Only registry tarballs with `integrity` in the lockfile are supported.
-- **Monolithic farm.** Any lockfile change rebuilds the farm derivation.
-  Individual fetch/extract layers are cached, but the farm is all-or-nothing.
+- **Reverse-dependency cascade.** Bumping a package rebuilds the cells of
+  everything that transitively depends on it. Each cell is one small
+  package copy and they build in parallel, but very popular leaves
+  (tslib, debug) touch a few hundred cells.
+- **Hoist fallback needs the sandbox.** Undeclared-dependency resolution
+  (pnpm's `.pnpm/node_modules` hoist) is provided via a `/build/.p2n-hoist`
+  indirection that assumes the standard Nix sandbox build dir.
 
 ## How it Works
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the hardlink
-staging approach, relative symlink scheme, scoped package handling,
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the cell/compose
+design, the SCC handling for dependency cycles, the hoist fallback,
 and the full pipeline internals.
 
 ## License

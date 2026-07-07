@@ -1,32 +1,61 @@
-# Build the shared .pnpm farm — the heart of the pnpm2nix pipeline.
+# The farm layer: per-snapshot "cell" derivations + thin compose layers.
 #
-# Lays out every non-workspace snapshot into a
-# `.pnpm/<encoded-key>/node_modules/<pkg>` directory tree, matching pnpm's
-# on-disk layout. Package *files* come from the extract layer; the farm adds
-# the directory skeleton, hardlinks to extracted files, and relative dep
-# symlinks.
+# Previous design: one monolithic derivation copying every package into a
+# shared `.pnpm/` tree. Any lockfile change rebuilt the whole thing (~GBs of
+# writes on non-CoW filesystems). This design splits the farm so a dep change
+# only rebuilds the affected snapshot chain:
 #
-# Build strategy:
-#   1. Copy each unique package from the Nix store into a staging area ONCE.
-#      Uses `cp --reflink=auto` so CoW filesystems (btrfs/ZFS) get instant
-#      metadata-only copies instead of full data writes.
-#   2. Make the staging area writable in one batched chmod pass.
-#   3. Hardlink (`cp -al`) from staging into every snapshot position.
-#      This works because both source and target are under $out (same mount).
-#   4. Remove the staging area; file data persists via the hardlinks.
-#   5. Create a hoisted `.pnpm/node_modules/` directory with symlinks to one
-#      representative snapshot per package name. This matches pnpm's default
-#      `hoistPattern: ['*']` behavior and is required for TypeScript's
-#      ancestor-walking `@types` resolution to work from within the farm.
+#   cell    — one derivation per snapshot (or per dependency cycle, see below).
+#             Layout: $out/<encoded-key>/node_modules/<pkg> with the package
+#             files copied from the extract layer, plus dep symlinks.
+#   compose — a derivation of nothing but symlinks:
+#             .pnpm/<encoded-key> → <cell>/<encoded-key>, plus the hoisted
+#             .pnpm/node_modules/ layer. Rebuilds on every lockfile change,
+#             but builds in about a second.
 #
-# Why not per-snapshot derivations?
-#   npm allows circular dependencies (A→B→C→A). Nix derivations can't
-#   reference each other cyclically — each derivation's hash depends on its
-#   inputs. A monolithic farm avoids this by wiring all dep symlinks within
-#   a single build.
+# Why absolute symlinks between cells work (and relative ones wouldn't):
+# Node resolves modules by realpath()ing a file, then walking *up* looking for
+# node_modules/. A file in cell A realpaths to
+# /nix/store/…-cell-A/<enc>/node_modules/<pkg>/…; the walk-up finds cell A's
+# own node_modules/ directory, whose dep symlinks point (absolutely) at other
+# cells' store paths. Following one lands in the dep's cell, where the same
+# invariant holds recursively. Relative links across cells would instead
+# resolve against /nix/store/ and dangle — that constraint is what previously
+# forced a monolithic farm.
+#
+# Cycles: npm allows circular dependencies (browserslist ↔
+# update-browserslist-db), and Nix derivations can't reference each other
+# cyclically. The parser emits the non-trivial SCCs of the snapshot graph
+# (`parsed.cycles`); all members of a cycle share one cell and link to each
+# other *relatively* (they're physically co-located, so relative links
+# resolve). The SCC condensation is a DAG, so absolute inter-cell references
+# always terminate. Real lockfiles have a handful of 2–6 member cycles.
+#
+# The hoist fallback: pnpm's default hoistPattern ['*'] gives every package
+# a last-resort lookup at .pnpm/node_modules/ for deps it uses but never
+# declared (nitro-opentelemetry requiring nitropack/kit, TypeScript's
+# ancestor-walking @types resolution). In the monolithic farm that worked
+# via physical co-location; a cell can't reach its consumer's compose layer
+# by walk-up. Instead each cell root carries a *dangling* symlink
+#   $out/node_modules → /build/.p2n-hoist
+# Node's walk-up from /nix/store/…-cell/<enc>/node_modules/<pkg>/… consults
+# the cell root's node_modules/ right after the snapshot's own deps; inside
+# an app build sandbox, workspace.nix points /build/.p2n-hoist at that app's
+# compose hoist dir. The link contains no store path, so cells stay
+# byte-identical across lockfile changes — no rebuild cascade through the
+# fallback — and each app resolves hoisted names against its own closure,
+# which is pnpm's global-hoist semantics scoped per importer. Outside a
+# sandbox the link dangles, which simply means "no hoist", the same as
+# running pnpm with hoist disabled.
+#
+# Caching behavior: bumping a dep rebuilds its fetch + extract + cell, plus
+# the cells of its reverse-dependency ancestors (their symlink targets
+# changed) and the compose layer. Each cell rebuild copies one package.
+# Unaffected cells are cached forever.
 #
 # Platform filtering is handled upstream (workspace.nix); everything arriving
-# here is already host-compatible.
+# here is already host-compatible. Filtering can drop members from a cycle
+# cell — harmless, since removing nodes never introduces new cycles.
 {
   lib,
   runCommand,
@@ -35,107 +64,139 @@
 parsed:
 extracted:
 let
-  inherit (lib) filterAttrs concatStringsSep mapAttrsToList;
+  inherit (lib) filterAttrs concatStringsSep mapAttrsToList optionalString hasPrefix;
   inherit ((callPackage ./encode.nix {})) encodeKey;
 
   nonWorkspaceSnapshots =
     filterAttrs (_: snap: !(snap.workspace or false)) parsed.snapshots;
 
-  # Unique package IDs referenced by non-workspace snapshots.
-  usedPkgIds =
-    lib.unique (mapAttrsToList (_: snap: snap.package) nonWorkspaceSnapshots);
+  # Cycle members share a cell whose id is the first (sorted) member key;
+  # every other snapshot is a singleton cell keyed by its own snapshot key.
+  cycleCellOf = builtins.listToAttrs (lib.flatten (map (members: let
+    id = builtins.head members;
+  in map (k: { name = k; value = id; }) members) (parsed.cycles or [])));
 
-  sanitizeId = id: builtins.replaceStrings ["/"] ["+"] id;
+  cellIdOf = key: cycleCellOf.${key} or key;
 
-  # --- Stage 1: copy each unique package into $out/.p/ (staging) ---
-  # --reflink=auto: near-instant on CoW filesystems, regular copy on ext4.
-  stageLines = concatStringsSep "\n" (map (pkgId: let
-    drv = extracted.${pkgId}
-      or (throw "pnpm2nix: snapshot references unknown package '${pkgId}' (missing integrity?)");
-    dir = sanitizeId pkgId;
-  in ''
-    cp --reflink=auto -a "${drv}" "$out/.p/${dir}"
-  '') usedPkgIds);
+  # cellId → [member snapshot keys], post platform filtering.
+  cellMembers = lib.groupBy cellIdOf (builtins.attrNames nonWorkspaceSnapshots);
 
-  # --- Stage 2: hardlink package files + create dep symlinks per snapshot ---
-  snapshotLines = concatStringsSep "\n" (mapAttrsToList (key: snap: let
-    enc = encodeKey key;
-    dir = sanitizeId snap.package;
+  # Recursive: dep link targets reference sibling cells. Terminates because
+  # the SCC condensation is a DAG.
+  cells = builtins.mapAttrs mkCell cellMembers;
 
-    # Only link deps that resolve to another non-workspace snapshot. Workspace
-    # deps are wired up by the importer layer (which knows the source paths).
-    resolvedDeps =
-      filterAttrs (_: depKey: nonWorkspaceSnapshots ? ${depKey}) snap.deps;
+  mkCell = cellId: memberKeys: let
+    firstSnap = nonWorkspaceSnapshots.${builtins.head memberKeys};
+    isCycle = builtins.length memberKeys > 1;
+    cellName = lib.strings.sanitizeDerivationName
+      ("pnpm-cell-${firstSnap.name}-${firstSnap.version}"
+        + optionalString isCycle "-cycle${toString (builtins.length memberKeys)}");
 
-    depLinks = concatStringsSep "\n" (mapAttrsToList (depName: depKey: let
-      isScoped = lib.hasPrefix "@" depName;
-      relPrefix = if isScoped then "../../../" else "../../";
-      # For aliases the dep name differs from the target snapshot's package name.
-      targetName = nonWorkspaceSnapshots.${depKey}.name;
+    memberBlock = key: let
+      snap = nonWorkspaceSnapshots.${key};
+      enc = encodeKey key;
+      drv = extracted.${snap.package}
+        or (throw "pnpm2nix: snapshot references unknown package '${snap.package}' (missing integrity?)");
+
+      # Only link deps that resolve to another non-workspace snapshot.
+      # Workspace deps are wired up by the importer layer.
+      resolvedDeps =
+        filterAttrs (_: depKey: nonWorkspaceSnapshots ? ${depKey}) snap.deps;
+
+      depLinks = concatStringsSep "\n" (mapAttrsToList (depName: depKey: let
+        # For aliases the dep name differs from the target's package name.
+        targetName = nonWorkspaceSnapshots.${depKey}.name;
+        encDep = encodeKey depKey;
+        # Scoped dep symlinks sit one directory deeper, so they need an
+        # extra `..` to escape back to the cell root.
+        relPrefix = if hasPrefix "@" depName then "../../../" else "../../";
+        target =
+          if cellIdOf depKey == cellId
+          then "${relPrefix}${encDep}/node_modules/${targetName}"
+          else "${cells.${cellIdOf depKey}}/${encDep}/node_modules/${targetName}";
+      in ''
+        mkdir -p "$out/${enc}/node_modules/$(dirname '${depName}')"
+        ln -s "${target}" "$out/${enc}/node_modules/${depName}"
+      '') resolvedDeps);
     in ''
-      mkdir -p "$out/.pnpm/${enc}/node_modules/$(dirname '${depName}')"
-      ln -s "${relPrefix}${encodeKey depKey}/node_modules/${targetName}" \
-            "$out/.pnpm/${enc}/node_modules/${depName}"
-    '') resolvedDeps);
+      mkdir -p "$out/${enc}/node_modules/$(dirname '${snap.name}')"
+      cp --reflink=auto -a "${drv}" "$out/${enc}/node_modules/${snap.name}"
+      ${depLinks}
+    '';
+  in
+    runCommand cellName {
+      passthru = { snapshotKeys = memberKeys; };
+    } (concatStringsSep "\n" (map memberBlock memberKeys) + ''
 
-  in ''
-    mkdir -p "$out/.pnpm/${enc}/node_modules/$(dirname '${snap.name}')"
-    cp -al "$out/.p/${dir}" "$out/.pnpm/${enc}/node_modules/${snap.name}"
-    ${depLinks}
-  '') nonWorkspaceSnapshots);
+      # Hoist fallback (see header comment). Deliberately dangling: resolves
+      # only inside an app build sandbox that materializes /build/.p2n-hoist.
+      ln -s /build/.p2n-hoist "$out/node_modules"
+    '');
 
-  # --- Stage 3: hoisted .pnpm/node_modules/ layer ---
-  # pnpm's default hoistPattern ['*'] creates a flat node_modules/ inside
-  # .pnpm/ containing one symlink per unique package name. This allows
-  # TypeScript's ancestor-walking @types resolution to find type packages
-  # that are not direct dependencies of a snapshot (e.g., @types/react for
-  # @react-google-maps/api which only declares @types/google.maps).
-  #
-  # For each unique package name, we pick one snapshot key and symlink:
-  #   .pnpm/node_modules/<name> → ../<encoded-key>/node_modules/<name>
-  #
-  # Collect { name → snapshotKey } mapping. Last-write-wins is fine; we just
-  # need one representative version per name.
-  nameToSnapshot = builtins.foldl' (acc: entry: acc // { ${entry.name} = entry.key; })
-    {} (mapAttrsToList (key: snap: { inherit key; inherit (snap) name; }) nonWorkspaceSnapshots);
+  # Transitive snapshot closure of a set of root snapshot keys. Used to build
+  # per-importer compose layers containing only what that importer can reach.
+  closureFor = rootKeys: map (x: x.key) (builtins.genericClosure {
+    startSet = map (k: { key = k; })
+      (builtins.filter (k: nonWorkspaceSnapshots ? ${k}) rootKeys);
+    operator = item: map (k: { key = k; })
+      (builtins.filter (k: nonWorkspaceSnapshots ? ${k})
+        (builtins.attrValues nonWorkspaceSnapshots.${item.key}.deps));
+  });
 
-  hoistLines = concatStringsSep "\n" (mapAttrsToList (name: snapKey: let
-    isScoped = lib.hasPrefix "@" name;
-    relPrefix = if isScoped then "../../" else "../";
-    enc = encodeKey snapKey;
-  in ''
-    mkdir -p "$out/.pnpm/node_modules/$(dirname '${name}')"
-    ln -s "${relPrefix}${enc}/node_modules/${name}" \
-          "$out/.pnpm/node_modules/${name}"
-  '') nameToSnapshot);
+  # A compose layer: `.pnpm/<enc>` symlinks into cells + the hoisted
+  # `.pnpm/node_modules/` layer (pnpm's default hoistPattern ['*'] — one
+  # symlink per unique package name, needed by TypeScript's ancestor-walking
+  # @types resolution and other undeclared-dependency lookups rooted at the
+  # importer).
+  mkCompose = { name ? "pnpm-farm", snapshotKeys }: let
+    keys = builtins.filter (k: nonWorkspaceSnapshots ? ${k}) snapshotKeys;
 
-in
-  runCommand "pnpm-farm" {
-    passthru = {
-      snapshotCount = builtins.length (builtins.attrNames nonWorkspaceSnapshots);
-      packageCount = builtins.length usedPkgIds;
-      hoistedCount = builtins.length (builtins.attrNames nameToSnapshot);
-    };
-  } ''
-    mkdir -p "$out/.pnpm" "$out/.p"
+    snapLines = concatStringsSep "\n" (map (key: let
+      enc = encodeKey key;
+    in ''
+      ln -s "${cells.${cellIdOf key}}/${enc}" "$out/.pnpm/${enc}"
+    '') keys);
 
-    # Stage 1: one copy per unique package into a staging area inside $out.
-    ${stageLines}
+    # One representative snapshot per package name; last-write-wins is fine.
+    nameToSnapshot = builtins.foldl' (acc: key:
+      acc // { ${nonWorkspaceSnapshots.${key}.name} = key; }) {} keys;
 
-    # Stage 1.5: batched chmod — one pass over the whole staging area instead
-    # of per-directory. Needed because cp -a preserves read-only perms from
-    # the Nix store, but cp -al (hardlink) requires writable directories.
-    chmod -R u+w "$out/.p"
+    hoistLines = concatStringsSep "\n" (mapAttrsToList (pkgName: snapKey: let
+      relPrefix = if hasPrefix "@" pkgName then "../../" else "../";
+      enc = encodeKey snapKey;
+    in ''
+      mkdir -p "$out/.pnpm/node_modules/$(dirname '${pkgName}')"
+      ln -s "${relPrefix}${enc}/node_modules/${pkgName}" \
+            "$out/.pnpm/node_modules/${pkgName}"
+    '') nameToSnapshot);
+  in
+    runCommand name {
+      passthru = {
+        snapshotCount = builtins.length keys;
+        hoistedCount = builtins.length (builtins.attrNames nameToSnapshot);
+      };
+    } ''
+      mkdir -p "$out/.pnpm/node_modules"
+      ${snapLines}
+      ${hoistLines}
+    '';
 
-    # Stage 2: hardlink from staging into each snapshot position, then create
-    # the relative dep symlinks that pnpm's node_modules layout requires.
-    ${snapshotLines}
-
-    # Stage 3: remove staging. Inodes persist via the hardlinks in stage 2.
-    rm -rf "$out/.p"
-
-    # Stage 4: create hoisted .pnpm/node_modules/ layer for TypeScript @types
-    # resolution and other ancestor-walking module lookups.
-    mkdir -p "$out/.pnpm/node_modules"
-    ${hoistLines}
-  ''
+  # Full compose over every snapshot — the classic "the farm" output,
+  # exposed as `pnpmStore`. Importers use pruned per-closure composes
+  # instead, so an app only rebuilds when its own dependency closure changes.
+  compose = mkCompose {
+    name = "pnpm-farm";
+    snapshotKeys = builtins.attrNames nonWorkspaceSnapshots;
+  };
+in {
+  inherit cells cellIdOf closureFor mkCompose compose;
+  composeFor = name: rootKeys: mkCompose {
+    inherit name;
+    snapshotKeys = closureFor rootKeys;
+  };
+  passthru = {
+    cellCount = builtins.length (builtins.attrNames cellMembers);
+    cycleCount = builtins.length (parsed.cycles or []);
+    snapshotCount = builtins.length (builtins.attrNames nonWorkspaceSnapshots);
+  };
+}

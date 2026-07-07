@@ -15,8 +15,8 @@ in {
   #   lockfile: pnpmLockYaml → parsed
   #   fetch:    parsed → fetched
   #   extract:  parsed → fetched → extracted
-  #   farm:     parsed → extracted → farmDrv
-  #   nodeModules: parsed → farmDrv → { mkImporterNodeModules, ... }
+  #   farm:     parsed → extracted → { cells, compose, composeFor, ... }
+  #   nodeModules: parsed → farmLib → { mkImporterNodeModules, ... }
   lockfile = pkgs.callPackage ./lockfile.nix {};
   fetch = pkgs.callPackage ./fetch.nix {};
   extract = pkgs.callPackage ./extract.nix {};

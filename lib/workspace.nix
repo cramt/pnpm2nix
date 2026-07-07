@@ -93,11 +93,12 @@
   # workspace is passed so extract can apply pnpm patches (patchedDependencies).
   extracted = (callPackage ./extract.nix {}) platformParsed fetched workspace;
 
-  # Stage 4: per-snapshot cell derivations + thin assembly symlink layer
-  farm = (callPackage ./farm.nix {}) platformParsed extracted;
+  # Stage 4: per-snapshot cell derivations + thin compose symlink layers
+  farmLib = (callPackage ./farm.nix {}) platformParsed extracted;
 
-  # Stage 5: per-importer node_modules (thin symlink layer over the farm)
-  nm = (callPackage ./nodeModules.nix {}) platformParsed farm;
+  # Stage 5: per-importer node_modules, each with its own closure-pruned
+  # compose layer over the shared cells
+  nm = (callPackage ./nodeModules.nix {}) platformParsed farmLib;
   inherit (nm) mkImporterNodeModules isWorkspaceKey encodeKey;
 
   # ---------------------------------------------------------------------------
@@ -181,7 +182,16 @@
   isolatedSrc = appName: let
     others = filter (a: a.name != appName) apps;
     excludePaths =
-      (map (a: workspace + "/${a.path}") others)
+      # pnpm-lock.yaml is consumed at eval time (IFD → farm); pnpm never
+      # reads it during `pnpm run` (node_modules is pre-materialized and
+      # verify_deps_before_run is off). Excluding it from app sources means
+      # a lockfile change only rebuilds apps whose dependency closure
+      # actually changed — otherwise every app would rebuild via src.
+      # NOTE: custom `appSrc` filters should exclude it too, for the same
+      # reason. (Guarded: a lockfile outside the workspace tree can't be
+      # part of the fileset anyway.)
+      (lib.optional (lib.hasPrefix (toString workspace) (toString pnpmLockYaml)) pnpmLockYaml)
+      ++ (map (a: workspace + "/${a.path}") others)
       ++ (let
         candidates = ["." "apps" "packages"];
         nestedNm = lib.flatten (map (root: let
@@ -256,6 +266,21 @@
     extraImporters = app.extraImporters or [];
     appComponents = ["."] ++ packages ++ [app.path] ++ extraImporters;
     setupAll = concatStringsSep "\n" (map importerSetupLines appComponents);
+
+    # Hoist fallback target for this build (see farm.nix header): a compose
+    # over everything reachable from every importer set up in this sandbox.
+    # Cells carry a dangling `node_modules → /build/.p2n-hoist` link at their
+    # root; pointing it at this compose's hoisted .pnpm/node_modules/ gives
+    # undeclared-dependency lookups (nitropack modules, @types walk-up) the
+    # same behavior as pnpm's default hoistPattern ['*'] — scoped to this
+    # app's closure, so its hash only moves when that closure does.
+    appHoistFarm = farmLib.composeFor
+      "pnpm-hoist-${lib.strings.sanitizeDerivationName app.name}"
+      (lib.unique (lib.flatten
+        (map (p: attrValues (importerTopLevelDeps p)) appComponents)));
+    hoistSetup = ''
+      ln -sfn "${appHoistFarm}/.pnpm/node_modules" "$NIX_BUILD_TOP/.p2n-hoist"
+    '';
     appBuildEnv = buildEnv // (app.buildEnv or {});
     appExtraNative = extraNativeBuildInputs ++ (app.extraNativeBuildInputs or []);
     script = app.script or "build";
@@ -301,6 +326,7 @@
       configurePhase = ''
         runHook preConfigure
         export HOME=$NIX_BUILD_TOP
+        ${hoistSetup}
         ${extrasInjection}
         ${setupAll}
         runHook postConfigure
@@ -338,7 +364,7 @@ in {
     value = mkApp a;
   }) apps);
   nodeModules = importerNodeModules;
-  pnpmStore = farm;
+  pnpmStore = farmLib.compose;
   # The pnpm derivation actually used to build this workspace. Exposed so
   # callers can reuse it for utility scripts (`nix run .#deps-update` etc.)
   # without re-resolving the version themselves.
@@ -346,6 +372,7 @@ in {
 
   # Internal/debug handles. Not API surface.
   passthru = {
-    inherit parsed fetched extracted farm importerNodeModules;
+    inherit parsed fetched extracted farmLib importerNodeModules;
+    farm = farmLib.compose;
   };
 }

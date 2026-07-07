@@ -1,13 +1,18 @@
-# Per-importer node_modules — a thin layer of symlinks on top of the shared farm.
+# Per-importer node_modules — a thin layer of symlinks on top of the farm.
 #
 # Each importer (workspace root, app, shared package) gets a tiny derivation
 # containing:
-#   node_modules/.pnpm   → <farm>/.pnpm           (symlink into shared farm)
+#   node_modules/.pnpm   → <compose>/.pnpm         (symlink into its farm)
 #   node_modules/<dep>   → .pnpm/<key>/.../<dep>   (top-level dep symlinks)
-#   node_modules/.bin/*  → <farm>/.pnpm/.../<bin>  (bin entry symlinks)
+#   node_modules/.bin/*  → <compose>/.pnpm/.../<bin> (bin entry symlinks)
+#
+# Each importer gets its own compose layer, pruned to the transitive closure
+# of its top-level deps. A lockfile change that doesn't touch an importer's
+# closure leaves that importer's node_modules (and therefore its app build)
+# fully cached.
 #
 # No package files are copied here — only symlinks and directory scaffolding.
-# The farm (lib/farm.nix) owns all the actual file content.
+# The cells (lib/farm.nix) own all the actual file content.
 {
   lib,
   runCommand,
@@ -15,7 +20,7 @@
   jq,
 }:
 parsed:
-farm:
+farmLib:
 let
   inherit (lib) concatStringsSep mapAttrsToList filterAttrs;
   inherit ((callPackage ./encode.nix {})) encodeKey;
@@ -77,9 +82,16 @@ let
     ) topLevelDeps;
     workspaceDirect = filterAttrs (_: k: isWorkspaceKey k) topLevelDeps;
 
-    # Single symlink connecting this importer's node_modules/.pnpm to the
-    # shared farm. Walk-up module resolution from inside .pnpm/ finds sibling
-    # snapshots as expected.
+    # This importer's own compose layer: only the snapshots reachable from
+    # its top-level deps. Pure symlinks, so it's cheap to (re)build — and its
+    # hash only changes when this importer's closure actually changes.
+    farm = farmLib.composeFor
+      "pnpm-farm-${lib.strings.sanitizeDerivationName name}"
+      (lib.attrValues registryDirect);
+
+    # Single symlink connecting this importer's node_modules/.pnpm to its
+    # compose layer. Walk-up module resolution from inside .pnpm/ finds
+    # sibling snapshot entries as expected.
     pnpmFarmLink = ''
       ln -s "${farm}/.pnpm" "$out/node_modules/.pnpm"
     '';
