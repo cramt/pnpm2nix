@@ -161,12 +161,21 @@ let
     nameToSnapshot = builtins.foldl' (acc: key:
       acc // { ${nonWorkspaceSnapshots.${key}.name} = key; }) {} keys;
 
+    # Hoist links are ABSOLUTE store paths, not pnpm-style relative siblings
+    # (../../<enc>/node_modules/<pkg>). The hoist dir is reached through each
+    # cell's dangling `node_modules → /build/.p2n-hoist` fallback, so a
+    # relative target's meaning depends on which path the consumer resolved
+    # the link through: Node fully realpath()s every hop and lands here, but
+    # readlink-and-join resolvers (@vercel/nft tracing nitro externals) join
+    # `../../` against the *consuming cell's* root and fabricate
+    # <consumer-cell>/<enc>/… paths that don't exist. Absolute targets are
+    # unambiguous for both, and add no closure: every hoisted cell is already
+    # referenced by snapLines above.
     hoistLines = concatStringsSep "\n" (mapAttrsToList (pkgName: snapKey: let
-      relPrefix = if hasPrefix "@" pkgName then "../../" else "../";
       enc = encodeKey snapKey;
     in ''
       mkdir -p "$out/.pnpm/node_modules/$(dirname '${pkgName}')"
-      ln -s "${relPrefix}${enc}/node_modules/${pkgName}" \
+      ln -s "${cells.${cellIdOf snapKey}}/${enc}/node_modules/${pkgName}" \
             "$out/.pnpm/node_modules/${pkgName}"
     '') nameToSnapshot);
   in
