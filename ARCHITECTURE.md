@@ -278,7 +278,7 @@ For non-workspace use or debugging:
 ```nix
 pnpm2nix.lockfile  # pnpmLockYaml → parsed
 pnpm2nix.fetch     # parsed → fetched
-pnpm2nix.extract   # parsed → fetched → extracted
+pnpm2nix.extract   # parsed → fetched → workspaceSrc → extracted
 pnpm2nix.farm      # parsed → extracted → { cells, compose, composeFor, closureFor, ... }
 pnpm2nix.nodeModules  # parsed → farmLib → { mkImporterNodeModules, ... }
 ```
@@ -303,7 +303,14 @@ pnpm2nix.nodeModules  # parsed → farmLib → { mkImporterNodeModules, ... }
 
 4. **Git/tarball-by-path dependencies**: Only registry tarballs with
    `integrity` hashes are supported. Git dependencies and `tarball:`
-   resolutions without integrity are skipped.
+   resolutions without integrity have no hash to fetch content-addressed;
+   the parser fails loudly with a clear error rather than silently dropping
+   them.
 
-5. **Hoist fallback needs the sandbox**: the `/build/.p2n-hoist` mechanism
+5. **Node bumps rebuild the farm**: `patchShebangs` bakes the concrete Node
+   store path into every extracted package with a shebang bin, so a `nodejs`
+   change invalidates those extracts and cascades through cells, composes,
+   and apps. Lockfile-only changes don't.
+
+6. **Hoist fallback needs the sandbox**: the `/build/.p2n-hoist` mechanism
    assumes builds run in the standard Nix sandbox (build dir `/build`).

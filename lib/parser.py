@@ -82,6 +82,20 @@ def is_workspace_ref(spec: str) -> bool:
     return spec.startswith(("link:", "file:", "workspace:"))
 
 
+def is_unsupported_ref(value: str) -> bool:
+    """A dep/version whose value is a git or HTTP(S) tarball URL.
+
+    pnpm records these in the version position (git+ssh://…, or an
+    https://…/foo.tgz codeload URL) and they carry no integrity hash, so we
+    can't fetch them content-addressed. They must fail loudly at parse time:
+    left alone, `resolve_dep_key` mistakes the URL for an npm alias key that
+    matches no snapshot, and the dep is silently dropped — surfacing much
+    later as a runtime module-not-found. Aliases never contain '://', so this
+    can't misfire on a real alias.
+    """
+    return "://" in value or value.startswith("git+")
+
+
 def is_alias_dep(dep_name: str, dep_value: str) -> bool:
     """Detect npm aliases: the dep name differs from the resolved package name.
 
@@ -257,6 +271,13 @@ def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
         deps_combined: dict[str, str] = {}
         for k in ("dependencies", "optionalDependencies"):
             for dep_name, dep_value in ((meta or {}).get(k) or {}).items():
+                if is_unsupported_ref(str(dep_value)):
+                    raise SystemExit(
+                        f"pnpm2nix: unsupported git/URL dependency: {key!r} "
+                        f"depends on {dep_name!r} via {dep_value!r}. Only "
+                        f"registry tarballs with an integrity hash are "
+                        f"supported."
+                    )
                 import_name, snapshot_key = resolve_dep_key(dep_name, dep_value)
                 deps_combined[import_name] = snapshot_key
 
@@ -285,6 +306,13 @@ def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
                 version_field = (dep_meta or {}).get("version")
                 if not version_field:
                     continue
+                if is_unsupported_ref(str(version_field)):
+                    raise SystemExit(
+                        f"pnpm2nix: unsupported git/URL dependency in importer "
+                        f"{path!r}: {dep_name!r} via {version_field!r}. Only "
+                        f"registry tarballs with an integrity hash are "
+                        f"supported."
+                    )
                 _import_name, snapshot_key = resolve_dep_key(
                     dep_name, version_field
                 )

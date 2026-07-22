@@ -175,7 +175,9 @@ pnpm2nix.lockfile    # path → workspaceYamlPath-or-null → parsed attrset (IF
                      # workspaceYamlPath is needed for pnpm 11+ patchedDependencies
                      # paths; pass null when unused.
 pnpm2nix.fetch       # parsed → { "pkg@ver" = <tarball>; ... }
-pnpm2nix.extract     # parsed → fetched → { "pkg@ver" = <extracted>; ... }
+pnpm2nix.extract     # parsed → fetched → workspaceSrc → { "pkg@ver" = <extracted>; ... }
+                     # workspaceSrc is the monorepo root, needed to resolve
+                     # patchedDependencies patch files; pass it even when unused.
 pnpm2nix.farm        # parsed → extracted → { cells, compose, composeFor, ... }
 pnpm2nix.nodeModules # parsed → farmLib → { mkImporterNodeModules, ... }
 ```
@@ -239,12 +241,20 @@ Unknown systems fall back to including everything (no filtering).
 - **Lifecycle scripts** (`postinstall`, etc.) are not run. Packages like
   esbuild and sharp that ship prebuilt binaries work fine; packages that
   compile native code in postinstall will not.
-- **Git/tarball dependencies** without integrity hashes are skipped.
+- **Git/tarball dependencies** without integrity hashes are unsupported —
+  there's no hash to fetch them content-addressed. pnpm2nix fails at parse
+  time with a clear error naming the offending dependency, rather than
+  silently dropping it (which would surface as a runtime module-not-found).
   Only registry tarballs with `integrity` in the lockfile are supported.
 - **Reverse-dependency cascade.** Bumping a package rebuilds the cells of
   everything that transitively depends on it. Each cell is one small
   package copy and they build in parallel, but very popular leaves
   (tslib, debug) touch a few hundred cells.
+- **Bumping `nodejs` rebuilds the farm.** `patchShebangs` rewrites each
+  package's `#!/usr/bin/env node` to the concrete Node store path at the
+  extract layer, so every extracted package with a shebang bin references
+  `nodejs` — a Node bump invalidates those extracts and cascades through
+  every cell, compose, and app. Bumping only the lockfile does not.
 - **Hoist fallback needs the sandbox.** Undeclared-dependency resolution
   (pnpm's `.pnpm/node_modules` hoist) is provided via a `/build/.p2n-hoist`
   indirection that assumes the standard Nix sandbox build dir.

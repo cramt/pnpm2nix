@@ -12,9 +12,9 @@ in {
 
   # Lower-level handles for non-workspace use or debugging. Each takes the
   # output of the previous stage and produces its layer:
-  #   lockfile: pnpmLockYaml → parsed
+  #   lockfile: pnpmLockYaml → workspaceYamlPath → parsed
   #   fetch:    parsed → fetched
-  #   extract:  parsed → fetched → extracted
+  #   extract:  parsed → fetched → workspaceSrc → extracted
   #   farm:     parsed → extracted → { cells, compose, composeFor, ... }
   #   nodeModules: parsed → farmLib → { mkImporterNodeModules, ... }
   lockfile = pkgs.callPackage ./lockfile.nix {};

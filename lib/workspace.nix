@@ -7,14 +7,8 @@
 {
   lib,
   stdenv,
-  runCommand,
-  python3,
-  fetchurl,
-  gnutar,
-  gzip,
   callPackage,
   pnpmLib,
-  pnpm ? null,
 }: {
   workspace,
   apps,
@@ -34,15 +28,12 @@
   extraNodeModuleSources ? [],
   noDevDependencies ? false,
   appSrc ? null,
-} @ callerArgs: let
+}: let
   # Resolution order:
-  #   1. explicit `pnpm` arg to mkPnpmWorkspace (inner)
-  #   2. `pnpm` override passed at callPackage time (outer)
-  #   3. derive from the workspace's package.json "packageManager" field
+  #   1. explicit `pnpm` arg to mkPnpmWorkspace
+  #   2. derive from the workspace's package.json "packageManager" field
   resolvedPnpm =
-    if (callerArgs.pnpm or null) != null
-    then callerArgs.pnpm
-    else if pnpm != null
+    if pnpm != null
     then pnpm
     else pnpmLib.pnpmFromPackageManager {inherit workspace nodejs;};
 
@@ -192,22 +183,18 @@
       # part of the fileset anyway.)
       (lib.optional (lib.hasPrefix (toString workspace) (toString pnpmLockYaml)) pnpmLockYaml)
       ++ (map (a: workspace + "/${a.path}") others)
+      # Exclude any local node_modules left in an importer directory by a dev
+      # `pnpm install`. Derived from the actual importer set (root + app +
+      # package paths) rather than hardcoded top-level dir names, so a
+      # workspace laid out under `services/` etc. isn't missed.
       ++ (let
-        candidates = ["." "apps" "packages"];
-        nestedNm = lib.flatten (map (root: let
-          dir = workspace + "/${root}";
-        in
-          if root == "."
-          then
-            (lib.optional (builtins.pathExists (dir + "/node_modules")) (dir + "/node_modules"))
-          else if builtins.pathExists dir
-          then
-            map (sub: dir + "/${sub}/node_modules")
-            (builtins.attrNames (builtins.readDir dir))
-          else [])
-        candidates);
+        importerDirs = ["."] ++ map (a: a.path) apps ++ packages;
+        nmOf = p:
+          if p == "."
+          then workspace + "/node_modules"
+          else workspace + "/${p}/node_modules";
       in
-        filter builtins.pathExists nestedNm);
+        filter builtins.pathExists (map nmOf importerDirs));
   in
     lib.fileset.toSource {
       root = workspace;
@@ -247,7 +234,10 @@
         s:
           if builtins.isAttrs s
           then ''cp -f "${s.value}" "${s.name}"''
-          else ''cp -f "${s}" "."''
+          # Bare-path form: land the file under its own filename. baseNameOf
+          # runs on the path value (not the interpolated store path), so it
+          # yields the clean name, not the `<hash>-name` store basename.
+          else ''cp -f "${s}" "./${baseNameOf s}"''
       )
       extraOthers
     );
