@@ -24,12 +24,13 @@
     safeName = builtins.replaceStrings ["/"] ["+"] spec.name;
     patchInfo = patchedDeps.${key} or null;
     hasPatch = patchInfo != null;
-    # Nix store paths cannot contain '@'. Use builtins.path with a sanitized
-    # name so the patch file gets a legal store path while still pointing at the
-    # original file on disk.
+    # Store path names can't contain '@', and pnpm 11 percent-encodes the '/'
+    # in scoped names ('@pierre%2Fdiffs@1.3.0-beta.5.patch'), which is illegal
+    # too. sanitizeDerivationName maps everything outside the legal set to '-'.
+    # builtins.path lets us rename without touching the file on disk.
     patchFile = if hasPatch then builtins.path {
       path = workspaceSrc + "/${patchInfo.path}";
-      name = builtins.replaceStrings ["@"] ["-"] (builtins.baseNameOf patchInfo.path);
+      name = lib.strings.sanitizeDerivationName (builtins.baseNameOf patchInfo.path);
     } else null;
   in runCommand "pnpm-pkg-${safeName}-${spec.version}" {
     nativeBuildInputs = [ gnutar gzip nodejs ] ++ lib.optional hasPatch gitMinimal;
