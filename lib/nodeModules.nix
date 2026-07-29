@@ -28,7 +28,8 @@ let
   # Shell function injected into each importer's build script. Reads the `bin`
   # field from a package's package.json and creates symlinks in the target
   # .bin/ directory. Handles both `"bin": "path"` and `"bin": { "name": "path" }`
-  # forms.
+  # forms. Bin names are basenamed the way npm's normalize-package-bin does —
+  # `"@vercel/config"` as a bin key means `.bin/config`, not a nested dir.
   populateBinForPkg = ''
     populate_bin_for_pkg() {
       local pkg_dir="$1"
@@ -41,7 +42,7 @@ let
         if (.bin | type) == "string"
           then "\((.name // "") | split("/") | last)\t\(.bin)"
         elif (.bin | type) == "object"
-          then .bin | to_entries | map("\(.key)\t\(.value)") | .[]
+          then .bin | to_entries | map("\((.key) | split("/") | last)\t\(.value)") | .[]
         else empty
         end
       ' "$pkg_json" 2>/dev/null) || return 0
