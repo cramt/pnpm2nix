@@ -29,13 +29,29 @@
   noDevDependencies ? false,
   appSrc ? null,
 }: let
+  # `workspace` is commonly a flake input (`inputs.foo`) or a store-path string
+  # rather than a literal `./.`. Those coerce fine in string contexts, but
+  # lib.fileset rejects anything that isn't a real path, so normalize once here
+  # and use `workspaceRoot` wherever path semantics are required.
+  # The context has to be discarded before appending: Nix refuses to append a
+  # store-path-carrying string to a path. The target already exists in the
+  # store, so there's nothing to build and no dependency to lose.
+  toPath = p:
+    if builtins.isPath p
+    then p
+    else /. + builtins.unsafeDiscardStringContext (toString p);
+  workspaceRoot = toPath workspace;
+
   # Resolution order:
   #   1. explicit `pnpm` arg to mkPnpmWorkspace
   #   2. derive from the workspace's package.json "packageManager" field
   resolvedPnpm =
     if pnpm != null
     then pnpm
-    else pnpmLib.pnpmFromPackageManager {inherit workspace nodejs;};
+    else pnpmLib.pnpmFromPackageManager {
+      inherit nodejs;
+      workspace = workspaceRoot;
+    };
 
   inherit (lib) mapAttrs filterAttrs concatStringsSep mapAttrsToList listToAttrs attrValues filter;
 
@@ -82,7 +98,7 @@
 
   # Stage 3: one tar extraction + patchShebangs per package (platform-filtered)
   # workspace is passed so extract can apply pnpm patches (patchedDependencies).
-  extracted = (callPackage ./extract.nix {}) platformParsed fetched workspace;
+  extracted = (callPackage ./extract.nix {}) platformParsed fetched workspaceRoot;
 
   # Stage 4: per-snapshot cell derivations + thin compose symlink layers
   farmLib = (callPackage ./farm.nix {}) platformParsed extracted;
@@ -181,8 +197,8 @@
       # NOTE: custom `appSrc` filters should exclude it too, for the same
       # reason. (Guarded: a lockfile outside the workspace tree can't be
       # part of the fileset anyway.)
-      (lib.optional (lib.hasPrefix (toString workspace) (toString pnpmLockYaml)) pnpmLockYaml)
-      ++ (map (a: workspace + "/${a.path}") others)
+      (lib.optional (lib.hasPrefix (toString workspaceRoot) (toString pnpmLockYaml)) (toPath pnpmLockYaml))
+      ++ (map (a: workspaceRoot + "/${a.path}") others)
       # Exclude any local node_modules left in an importer directory by a dev
       # `pnpm install`. Derived from the actual importer set (root + app +
       # package paths) rather than hardcoded top-level dir names, so a
@@ -191,15 +207,15 @@
         importerDirs = ["."] ++ map (a: a.path) apps ++ packages;
         nmOf = p:
           if p == "."
-          then workspace + "/node_modules"
-          else workspace + "/${p}/node_modules";
+          then workspaceRoot + "/node_modules"
+          else workspaceRoot + "/${p}/node_modules";
       in
         filter builtins.pathExists (map nmOf importerDirs));
   in
     lib.fileset.toSource {
-      root = workspace;
+      root = workspaceRoot;
       fileset = lib.fileset.difference
-        workspace
+        workspaceRoot
         (lib.fileset.unions excludePaths);
     };
 
