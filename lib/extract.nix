@@ -55,7 +55,31 @@
     # Apply pnpm patch for ${key}
     echo "pnpm2nix: applying patch ${patchInfo.path} to ${key}"
     cd $out
-    git apply --unsafe-paths "${patchFile}"
+
+    # pnpm records a deleted file the way `git diff --irreversible-delete`
+    # does: a bare header with no hunk body. git apply refuses to act on that
+    # ("removal patch leaves file contents") and git-diff(1) says as much —
+    # the form "cannot be applied with git apply". pnpm's own JS applier just
+    # unlinks the file, so split those sections off, do the unlink here, and
+    # hand git the rest.
+    patchTmp=$(mktemp -d)
+    # awk only creates the files it writes to; the reads below want both.
+    touch "$patchTmp/deletions" "$patchTmp/rest.patch"
+    awk -v delfile="$patchTmp/deletions" \
+        -v keepfile="$patchTmp/rest.patch" \
+        -v statusfile="$patchTmp/status" \
+        -f ${./split-irreversible-deletes.awk} "${patchFile}"
+
+    while IFS= read -r deletedPath; do
+      [ -n "$deletedPath" ] || continue
+      rm -f "$deletedPath"
+    done < "$patchTmp/deletions"
+
+    if [ "$(cat "$patchTmp/status")" = 1 ]; then
+      git apply --unsafe-paths "$patchTmp/rest.patch"
+    fi
+
+    rm -rf "$patchTmp"
     cd -
   '' + ''
 

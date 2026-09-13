@@ -220,6 +220,14 @@ The Python parser (`lib/parser.py`) converts `pnpm-lock.yaml` v9 into:
 }
 ```
 
+`patchedDependencies` entries are applied in `extract`, after the
+tarball is unpacked. pnpm writes those patch files the way `git diff
+--irreversible-delete` does — a deleted file is a bare header with no
+hunk body — and `git apply` refuses that form outright ("removal patch
+leaves file contents"). `lib/split-irreversible-deletes.awk` peels those
+sections off so the file can be unlinked directly and `git apply` gets
+only what it can handle.
+
 **packages vs. snapshots**: A package is `react@18.2.0` — one tarball.
 A snapshot is `react@18.2.0(react-dom@18.2.0)` — a specific peer
 resolution. Two snapshots can share the same package (tarball) but have
