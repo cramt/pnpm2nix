@@ -323,9 +323,13 @@
       #   `packageManager` field and tries to switch versions otherwise.
       # - side_effects_cache=false: pnpm's side-effects cache wants to write
       #   into a directory that doesn't exist in the sandbox.
+      # - pm_on_fail=ignore: pnpm 11+ replacement for the above. Without it
+      #   pnpm 12 resolves the packageManager pin against the registry before
+      #   every run, even when the running version already matches.
       env = {
         PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = "false";
         PNPM_CONFIG_MANAGE_PACKAGE_MANAGER_VERSIONS = "false";
+        PNPM_CONFIG_PM_ON_FAIL = "ignore";
         PNPM_CONFIG_SIDE_EFFECTS_CACHE = "false";
       };
 

@@ -77,14 +77,22 @@ without anyone having to bump it in multiple places.
 ```
 
 Versions are looked up in `pnpm-versions.json` at the root of this repo,
-which maps `<version>` → npm tarball SRI integrity hash. The file is
-populated by:
+which maps `<version>` → npm tarball SRI integrity hash.
+
+pnpm 12+ is a native Rust binary; its `pnpm` npm tarball is only a wrapper
+that downloads the binary on first run, which the sandbox forbids. For
+those versions pnpm2nix fetches the prebuilt `@pnpm/exe.<target>` package
+instead (the static musl build on linux), with hashes from
+`pnpm-exe-versions.json` (`<version>` → `<target>` → integrity).
+
+Both files are populated by:
 
 ```bash
 node scripts/update-pnpm-versions.mjs
 ```
 
-The script fetches the npm packument for pnpm and writes/updates every
+The script fetches the npm packuments for pnpm (and the `@pnpm/exe.*`
+targets) and writes/updates every
 published version's integrity hash. It is idempotent — existing entries
 are preserved (npm tarballs are immutable), only newly-published
 versions are added. Run it whenever you bump pnpm and the new version
@@ -229,8 +237,10 @@ Unknown systems fall back to including everything (no filtering).
 
 ## Requirements
 
-- **pnpm-lock.yaml v9** (pnpm 9.x). Older lockfile versions are not
-  supported.
+- **pnpm-lock.yaml v9** (pnpm 9 through 12). Older lockfile versions are
+  not supported. pnpm 11+ lockfiles that lead with an env-lockfile document
+  (the `packageManagerDependencies` pin) are handled; that document is
+  skipped.
 - **Nix with flakes** enabled.
 - The lockfile parser uses IFD (Import From Derivation), which requires
   Python 3 + PyYAML at eval time. These come from nixpkgs and are

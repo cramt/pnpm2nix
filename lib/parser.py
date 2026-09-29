@@ -205,10 +205,34 @@ def find_cycles(snapshots: dict[str, dict]) -> list[list[str]]:
     return sorted(cycles)
 
 
-def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
-    data = yaml.safe_load(Path(lockfile_path).read_text())
-    if not isinstance(data, dict):
+def is_env_lockfile(doc: dict) -> bool:
+    # pnpm 11+ prepends an "env lockfile" document pinning pnpm itself
+    # (packageManagerDependencies) and configDependencies. It describes the
+    # tooling, not the workspace; the real root importer has neither key.
+    root = (doc.get("importers") or {}).get(".") or {}
+    return "packageManagerDependencies" in root or "configDependencies" in root
+
+
+def load_lockfile(lockfile_path: str) -> dict:
+    docs = [
+        d for d in yaml.safe_load_all(Path(lockfile_path).read_text())
+        if d is not None
+    ]
+    if not all(isinstance(d, dict) for d in docs):
         raise SystemExit("pnpm-lock.yaml: expected a mapping at root")
+    if len(docs) == 1:
+        return docs[0]
+    workspace_docs = [d for d in docs if not is_env_lockfile(d)]
+    if len(workspace_docs) != 1:
+        raise SystemExit(
+            f"pnpm-lock.yaml: expected exactly one workspace document "
+            f"alongside the env lockfile, found {len(workspace_docs)}"
+        )
+    return workspace_docs[0]
+
+
+def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
+    data = load_lockfile(lockfile_path)
 
     lockfile_version = str(data.get("lockfileVersion", ""))
     if not lockfile_version.startswith("9"):
