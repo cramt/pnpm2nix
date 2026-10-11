@@ -281,6 +281,18 @@
     "linux-arm64-musl": "sha512-uMEYDwKRktGwANubQ+kYCwmhNwg3Ik6qK89ahsbQ5cP30R/5FVJb/T99vr9XRUBC/A7mZI6eeT92oyVas9ACyg==",
     "linux-x64-musl": "sha512-7eIxQR05fvJxCujUSKp5KTtehJ7QqrgqP/HD1+BcB/SaV2Be4XI1PEHiOgA1zxsiMIeMvTF6E4G4dYHrFjeXRg=="
   },
+  "12.12.0": {
+    "darwin-arm64": "sha512-yGekz0hxwvhSVB7/2V1NJYsuvLNg/VBjT5NuDMC6LZo9WH2SofWxquCjGMAI8rJ/BKlu00D2Mb+qQUCxVXjTGA==",
+    "darwin-x64": "sha512-cPgf74DmC9g0QhGtLXGbf0UppzOio4PaBfuuzAvnCUdZHswYZJf/5fK+FFdsb0XzGnOZfHWh6b85j6DFM3Osaw==",
+    "linux-arm64-musl": "sha512-ENN5I6jgU/Sq7r9PZ4KarCVp/VE9xHeWTzyVtitEnCGMwCloP4cFYmIo/K5DjHvwoxFi+aZbfin6iZ9X2tk0kQ==",
+    "linux-x64-musl": "sha512-iYzGDLWNRZ89rZOVvIeWqS5L+HUc6eM+YrdxfMNhaJmx7bbUetp91pgQoYLGogdwy0/fFUixHP7AUXuLA9eoag=="
+  },
+  "12.12.1": {
+    "darwin-arm64": "sha512-MiDDp8DLFFizQId7oiOhtzZ2yM97d3gHVFAxL0wgFCu/SZv8enY9N283HJebyAj63P2pDIYe70krHgWEyVvElQ==",
+    "darwin-x64": "sha512-81CoZFGlOddF7kiuW+KRMabrWpUWyfljPydes6n8P3sFGBdR+d04tKP8E9I9wp4MQ+kj/n2g8MbFDu0+c7pwSw==",
+    "linux-arm64-musl": "sha512-Evrem/af4+oqkjRv9sSBdXTPGDWsxMActgpVpUvMeSWm/42r58PtzIikZF+9YKaBYXF/CjmqasGvgeIsLicdQg==",
+    "linux-x64-musl": "sha512-uYugCvgK4S+cYNldIaU54Ir54EYUvb+mnm37c0jfjZajCJ2EevnxS3107cNNQINHhMb2wiAzItg3r7XKvHyHpA=="
+  },
   "12.2.0": {
     "darwin-arm64": "sha512-x9ptl28DNc8ZXiuuaA0fObUIY3ieZH7uI2ovxH/EE8/GwFn4Wc2ysyGIOHTYEa3A9teKIn9T7J75Sp4TJ5+WOA==",
     "darwin-x64": "sha512-GlLm/KclJEj8MJ8xp+i685QSFD0ZlrMtUSB4veiNFP9T1Gf7P0+PToPust7CamAZ4XJJp1/pT038OCExIvlA+g==",
