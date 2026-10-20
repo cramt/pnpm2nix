@@ -25,6 +25,9 @@ primitives (`fetchurl`, `runCommand`, hardlinks, symlinks).
   nothing else.
 - **Source isolation.** Each app build only sees its own source tree.
   Touching app B doesn't invalidate app A's cache.
+- **Workspace `prepare` scripts.** Shared packages' `prepare` (a types
+  build, codegen) runs once per package and every app builds against the
+  prepared tree, as after a local `pnpm install`.
 
 ## Quick Start
 
@@ -151,6 +154,10 @@ pnpm2nix.mkPnpmWorkspace {
   extraNativeBuildInputs = [];       # Extra inputs for all builds
   extraNodeModuleSources = [];       # Files to inject (e.g. .npmrc)
   noDevDependencies = false;         # Exclude devDependencies
+  prepareWorkspacePackages = true;   # Run shared packages' `prepare` scripts,
+                                     # as `pnpm install` does (see below)
+  packageSrc = null;                 # path -> src for those prepare builds
+                                     # (default: workspace minus app dirs)
 }
 ```
 
@@ -164,6 +171,9 @@ pnpm2nix.mkPnpmWorkspace {
   nodeModules = {
     "." = <derivation>;           # Root node_modules
     "apps/my-app" = <derivation>; # Per-importer node_modules
+  };
+  prepared = {
+    "packages/my-lib" = <derivation>; # Package dir after `prepare`
   };
   pnpmStore = <derivation>;  # Full compose farm over every snapshot
   pnpm = <derivation>;       # The pnpm used to build this workspace
@@ -248,7 +258,8 @@ Unknown systems fall back to including everything (no filtering).
 
 ## Limitations
 
-- **Lifecycle scripts** (`postinstall`, etc.) are not run. Packages like
+- **Dependency lifecycle scripts** (`postinstall`, etc.) are not run;
+  only workspace packages' own `prepare` is. Packages like
   esbuild and sharp that ship prebuilt binaries work fine; packages that
   compile native code in postinstall will not.
 - **Git/tarball dependencies** without integrity hashes are unsupported —

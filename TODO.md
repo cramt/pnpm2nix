@@ -23,6 +23,10 @@ Measured on the profiled monorepo:
 
 ## P1 — Lifecycle scripts (`onlyBuiltDependencies`)
 
+Workspace packages' own `prepare` scripts now run (one derivation per
+package, overlaid into every build). What follows is about *dependencies'*
+install scripts, which still don't.
+
 Packages with `postinstall` scripts (esbuild, sharp, workerd) are extracted
 but their lifecycle scripts are NOT run. The `onlyBuiltDependencies` field
 in `pnpm-workspace.yaml` is not honored. Packages that need native binaries

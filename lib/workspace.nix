@@ -28,6 +28,13 @@
   extraNodeModuleSources ? [],
   noDevDependencies ? false,
   appSrc ? null,
+  # Run workspace packages' `prepare` scripts, as `pnpm install` does, and
+  # build every app against the prepared packages. See "Workspace `prepare`
+  # scripts" below.
+  prepareWorkspacePackages ? true,
+  # Source for a package's prepare derivation, as `path -> src`. Defaults to
+  # the workspace minus app dirs. Mirrors `appSrc` for callers that filter.
+  packageSrc ? null,
 }: let
   # `workspace` is commonly a flake input (`inputs.foo`) or a store-path string
   # rather than a literal `./.`. Those coerce fine in string contexts, but
@@ -259,18 +266,148 @@
     );
 
   # ---------------------------------------------------------------------------
+  # Workspace `prepare` scripts.
+  #
+  # `pnpm install` runs every workspace package's `prepare`, so whatever it
+  # generates (a types build in dist/, codegen) is what consumers resolve
+  # locally even though it's gitignored. Each shared package with a `prepare`
+  # gets one derivation that runs it and outputs the prepared package dir; every
+  # build then lays those over the package sources before running, so the
+  # sandbox sees the same tree a local install would.
+  # ---------------------------------------------------------------------------
+
+  readManifest = path: let
+    file = workspaceRoot + "/${path}/package.json";
+  in
+    if builtins.pathExists file
+    then builtins.fromJSON (builtins.readFile file)
+    else {};
+
+  preparedPaths =
+    if prepareWorkspacePackages
+    then filter (p: ((readManifest p).scripts or {}) ? prepare) packages
+    else [];
+
+  # `a/b` + `../c` -> `a/c`, for the lockfile's importer-relative link: paths.
+  joinRelative = base: rel: let
+    step = acc: seg:
+      if seg == "" || seg == "."
+      then acc
+      else if seg == ".."
+      then lib.init acc
+      else acc ++ [seg];
+    segments = lib.foldl' step
+      (filter (s: s != "" && s != ".") (lib.splitString "/" base))
+      (lib.splitString "/" rel);
+  in
+    if segments == [] then "." else concatStringsSep "/" segments;
+
+  workspaceDepPaths = importerPath:
+    mapAttrsToList (depName: depKey: let
+      versionPart = builtins.substring (lib.stringLength depName + 1) (-1) depKey;
+      rel = lib.removePrefix "link:"
+        (lib.removePrefix "file:"
+          (lib.removePrefix "workspace:" versionPart));
+    in
+      joinRelative importerPath rel)
+    (filterAttrs (_: k: isWorkspaceKey k) (importerTopLevelDeps importerPath));
+
+  # Prepared packages a package's own `prepare` needs first: the prepared ones
+  # among its transitive workspace deps. A cycle between two packages that both
+  # have `prepare` can't be ordered (pnpm can't either) and recurses at eval.
+  preparedDepsOf = path: let
+    closure = builtins.genericClosure {
+      startSet = map (p: {key = p;}) (workspaceDepPaths path);
+      operator = item: map (p: {key = p;}) (workspaceDepPaths item.key);
+    };
+  in
+    filter (p: p != path && builtins.elem p preparedPaths) (map (c: c.key) closure);
+
+  # Default source for a prepare derivation: the workspace without any app
+  # (packages nested inside an app dir are kept), so editing an app doesn't
+  # re-run every package's prepare.
+  packagesOnlySrc = let
+    # An app entry can sit at a package's path (e.g. a per-package check);
+    # that's still a package, so keep it.
+    appDirs = filter (p: !builtins.elem p packages) (lib.unique (map (a: a.path) apps));
+    nestedPackages = filter (p: lib.any (a: lib.hasPrefix "${a}/" p) appDirs) packages;
+    existing = paths: filter builtins.pathExists (map (p: workspaceRoot + "/${p}") paths);
+    excludedApps = lib.fileset.difference
+      (lib.fileset.unions (existing appDirs))
+      (lib.fileset.unions (existing nestedPackages));
+    lockfile = lib.optional
+      (lib.hasPrefix (toString workspaceRoot) (toString pnpmLockYaml))
+      (toPath pnpmLockYaml);
+    nodeModulesDirs = existing (map (p: if p == "." then "node_modules" else "${p}/node_modules")
+      (["."] ++ packages ++ appDirs));
+  in
+    lib.fileset.toSource {
+      root = workspaceRoot;
+      fileset = lib.fileset.difference workspaceRoot
+        (lib.fileset.unions ([excludedApps] ++ lockfile ++ nodeModulesDirs));
+    };
+
+  overlayPreparedLines = paths: concatStringsSep "\n" (map (p: ''
+    cp -r "${prepared.${p}}/." "${p}/"
+    chmod -R u+w "${p}"
+  '') paths);
+
+  prepared = listToAttrs (map (path: {
+    name = path;
+    value = mkBuild {
+      name = "prepare-${lib.strings.sanitizeDerivationName path}";
+      inherit path;
+      src = if packageSrc != null then packageSrc path else packagesOnlySrc;
+      script = "prepare";
+      overlay = preparedDepsOf path;
+      installPhase = ''
+        runHook preInstall
+        mkdir -p $out
+        find "${path}" -mindepth 1 -maxdepth 1 ! -name node_modules -exec cp -r {} $out/ \;
+        runHook postInstall
+      '';
+    };
+  }) preparedPaths);
+
+  # ---------------------------------------------------------------------------
   # Per-app build derivation.
   # ---------------------------------------------------------------------------
 
   mkApp = app: let
+    distDir = app.distDir or "dist";
+  in mkBuild {
+    inherit (app) name path;
+    version = app.version or "0.0.0";
+    src = if appSrc != null then appSrc app.name else isolatedSrc app.name;
+    script = app.script or "build";
+    extraImporters = app.extraImporters or [];
+    buildEnv = app.buildEnv or {};
+    extraNativeBuildInputs = app.extraNativeBuildInputs or [];
+    preBuildPackages = app.preBuildPackages or [];
+    overlay = preparedPaths;
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      if [ -d "${app.path}/${distDir}" ]; then
+        cp -r "${app.path}/${distDir}/." $out/
+      else
+        echo "warning: dist dir ${app.path}/${distDir} not found; copying app dir as-is"
+        cp -r "${app.path}/." $out/
+      fi
+      runHook postInstall
+    '';
+  };
+
+  mkBuild = build: let
     # Extra workspace importers whose node_modules must be set up in the
     # sandbox even though they aren't built here. Use when the app's source
     # (or its bundler/typechecker) pulls another importer's source into the
     # program and so needs that importer's dependencies resolvable — e.g. a
     # cross-app type consumer whose `tsc` compiles a sibling app's source via
     # generated types. Their dirs must also be present in the app's `src`.
-    extraImporters = app.extraImporters or [];
-    appComponents = ["."] ++ packages ++ [app.path] ++ extraImporters;
+    app = build;
+    extraImporters = build.extraImporters or [];
+    appComponents = lib.unique (["."] ++ packages ++ [app.path] ++ extraImporters);
     setupAll = concatStringsSep "\n" (map importerSetupLines appComponents);
 
     # Hoist fallback target for this build (see farm.nix header): a compose
@@ -287,22 +424,20 @@
     hoistSetup = ''
       ln -sfn "${appHoistFarm}/.pnpm/node_modules" "$NIX_BUILD_TOP/.p2n-hoist"
     '';
-    appBuildEnv = buildEnv // (app.buildEnv or {});
-    appExtraNative = extraNativeBuildInputs ++ (app.extraNativeBuildInputs or []);
-    script = app.script or "build";
-    distDir = app.distDir or "dist";
+    appBuildEnv = buildEnv // (build.buildEnv or {});
+    appExtraNative = extraNativeBuildInputs ++ (build.extraNativeBuildInputs or []);
     # Workspace packages whose build script must run before the app build.
     # Useful when a workspace package produces gitignored build artifacts
-    # (e.g. codegen, asset inlining) that the app's bundler needs to resolve.
-    preBuildPackages = app.preBuildPackages or [];
+    # (e.g. codegen, asset inlining) that the app's bundler needs to resolve
+    # and that its `prepare` doesn't already produce.
     preBuildLines = concatStringsSep "\n" (map (pkg:
       "pnpm --filter ./${pkg} run build"
-    ) preBuildPackages);
+    ) (build.preBuildPackages or []));
   in
     stdenv.mkDerivation {
-      pname = app.name;
-      version = app.version or "0.0.0";
-      src = if appSrc != null then appSrc app.name else isolatedSrc app.name;
+      pname = build.name;
+      version = build.version or "0.0.0";
+      inherit (build) src installPhase;
       nativeBuildInputs = [nodejs resolvedPnpm] ++ appExtraNative;
 
       # The node_modules tree is full of store-pointing symlinks. fixupPhase
@@ -338,6 +473,7 @@
         export HOME=$NIX_BUILD_TOP
         ${hoistSetup}
         ${extrasInjection}
+        ${overlayPreparedLines (build.overlay or [])}
         ${setupAll}
         runHook postConfigure
       '';
@@ -346,25 +482,19 @@
         runHook preBuild
         ${concatStringsSep "\n" (mapAttrsToList (k: v: ''export ${k}=${lib.escapeShellArg v}'') appBuildEnv)}
         ${preBuildLines}
-        pnpm --filter ./${app.path} run ${script}
+        # pnpm exits 0 on "No projects matched the filters", so an importer
+        # missing from src would otherwise build nothing and look green.
+        if [ ! -f "${build.path}/package.json" ]; then
+          echo "pnpm2nix: ${build.path}/package.json is not in this build's src" >&2
+          exit 1
+        fi
+        pnpm --filter ./${build.path} run ${build.script}
         runHook postBuild
       '';
 
-      installPhase = ''
-        runHook preInstall
-        mkdir -p $out
-        if [ -d "${app.path}/${distDir}" ]; then
-          cp -r "${app.path}/${distDir}/." $out/
-        else
-          echo "warning: dist dir ${app.path}/${distDir} not found; copying app dir as-is"
-          cp -r "${app.path}/." $out/
-        fi
-        runHook postInstall
-      '';
-
       passthru = {
-        nodeModules = importerNodeModules.${app.path};
-        inherit (app) name path;
+        nodeModules = importerNodeModules.${build.path};
+        inherit (build) name path;
       };
     };
 
@@ -374,6 +504,9 @@ in {
     value = mkApp a;
   }) apps);
   nodeModules = importerNodeModules;
+  # One derivation per workspace package with a `prepare` script, keyed by
+  # path; its output is the prepared package dir (node_modules excluded).
+  inherit prepared;
   pnpmStore = farmLib.compose;
   # The pnpm derivation actually used to build this workspace. Exposed so
   # callers can reuse it for utility scripts (`nix run .#deps-update` etc.)

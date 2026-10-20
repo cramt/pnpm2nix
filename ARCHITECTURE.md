@@ -182,6 +182,7 @@ Each app's `stdenv.mkDerivation`:
 2. **Configure phase**:
    - Points `/build/.p2n-hoist` at the app's hoist compose
    - Injects `.npmrc` with sandbox-required settings
+   - Lays each prepared workspace package (see below) over its source dir
    - For each importer (root + packages + this app):
      - `cp -aT` the importer node_modules (copies symlinks, not data)
      - Creates workspace dep symlinks (relative to source tree)
@@ -189,6 +190,21 @@ Each app's `stdenv.mkDerivation`:
 3. **Build phase**: `pnpm --filter ./<app> run build`
 
 4. **Install phase**: copies `<app>/<distDir>/` to `$out/`
+
+### Workspace `prepare` scripts
+
+`pnpm install` runs the `prepare` script of every workspace package, so its
+gitignored output (a types build in `dist/`, generated code) is part of the
+tree consumers resolve against locally. Each shared package with a `prepare`
+gets its own derivation built with the same flow as an app: source is the
+workspace minus app dirs (override with `packageSrc`), the prepared outputs
+of its own workspace deps are laid in first, and `$out` is the package dir
+after `prepare`, `node_modules` excluded. App builds copy every prepared
+package over its source in the configure phase.
+
+Output outside the package dir is not captured. Two packages with `prepare`
+that depend on each other can't be ordered and recurse at eval, as pnpm
+can't order them either. Opt out with `prepareWorkspacePackages = false`.
 
 ## Lockfile Schema
 
@@ -293,7 +309,7 @@ pnpm2nix.nodeModules  # parsed → farmLib → { mkImporterNodeModules, ... }
 
 ## Known Limitations
 
-1. **Lifecycle scripts**: Packages with `postinstall` scripts (esbuild,
+1. **Dependency lifecycle scripts**: Packages with `postinstall` scripts (esbuild,
    sharp, workerd) are extracted but their lifecycle scripts are NOT run.
    The `onlyBuiltDependencies` field in `pnpm-workspace.yaml` is not yet
    honored. Packages that need native binaries from postinstall will have
