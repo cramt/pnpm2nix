@@ -17,10 +17,13 @@ function flush(  i) {
   isdiff = 0
   path = ""
 }
+# Any `diff ` header starts a section, so a plain `diff -ruN` section after a
+# git one isn't folded into it (its hunks would hide the deletion).
+/^diff / { flush() }
 /^diff --git / {
-  flush()
   isdiff = 1
   path = substr($0, index($0, " b/") + 3)
+  sub(/\r$/, "", path)
 }
 /^deleted file mode / { deleted = 1 }
 /^@@/ { hunks++ }

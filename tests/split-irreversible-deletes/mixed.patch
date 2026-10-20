@@ -1,0 +1,9 @@
+diff --git a/gone.js b/gone.js
+deleted file mode 100644
+index 1234567..0000000
+diff -ruN a/kept.js b/kept.js
+--- a/kept.js
++++ b/kept.js
+@@ -1,1 +1,1 @@
+-a
++b

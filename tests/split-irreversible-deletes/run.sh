@@ -20,3 +20,5 @@ check() {
 check plain-diff.patch 1 ""
 check git-delete-and-edit.patch 1 "gone.js"
 check git-delete-only.patch 0 "gone.js"
+check mixed.patch 1 "gone.js"
+check crlf-delete-only.patch 0 "gone.js"

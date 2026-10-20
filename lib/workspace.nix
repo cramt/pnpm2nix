@@ -289,67 +289,70 @@
     else [];
 
   # `a/b` + `../c` -> `a/c`, for the lockfile's importer-relative link: paths.
+  # null when the link leaves the workspace: there's no importer to follow.
   joinRelative = base: rel: let
     step = acc: seg:
-      if seg == "" || seg == "."
+      if acc == null || seg == "" || seg == "."
       then acc
       else if seg == ".."
-      then lib.init acc
+      then (if acc == [] then null else lib.init acc)
       else acc ++ [seg];
     segments = lib.foldl' step
       (filter (s: s != "" && s != ".") (lib.splitString "/" base))
       (lib.splitString "/" rel);
   in
-    if segments == [] then "." else concatStringsSep "/" segments;
+    if segments == null then null
+    else if segments == [] then "."
+    else concatStringsSep "/" segments;
 
   workspaceDepPaths = importerPath:
-    mapAttrsToList (depName: depKey: let
+    filter (p: p != null) (mapAttrsToList (depName: depKey: let
       versionPart = builtins.substring (lib.stringLength depName + 1) (-1) depKey;
       rel = lib.removePrefix "link:"
         (lib.removePrefix "file:"
           (lib.removePrefix "workspace:" versionPart));
     in
       joinRelative importerPath rel)
-    (filterAttrs (_: k: isWorkspaceKey k) (importerTopLevelDeps importerPath));
+    (filterAttrs (_: k: isWorkspaceKey k) (importerTopLevelDeps importerPath)));
+
+  # Every importer a package reaches through workspace links, itself excluded.
+  workspaceClosureOf = path:
+    filter (p: p != path) (map (c: c.key) (builtins.genericClosure {
+      startSet = map (p: {key = p;}) (workspaceDepPaths path);
+      operator = item: map (p: {key = p;}) (workspaceDepPaths item.key);
+    }));
 
   # Prepared packages a package's own `prepare` needs first: the prepared ones
   # among its transitive workspace deps. A cycle between two packages that both
   # have `prepare` can't be ordered (pnpm can't either) and recurses at eval.
-  preparedDepsOf = path: let
-    closure = builtins.genericClosure {
-      startSet = map (p: {key = p;}) (workspaceDepPaths path);
-      operator = item: map (p: {key = p;}) (workspaceDepPaths item.key);
-    };
-  in
-    filter (p: p != path && builtins.elem p preparedPaths) (map (c: c.key) closure);
+  preparedDepsOf = path:
+    filter (p: builtins.elem p preparedPaths) (workspaceClosureOf path);
 
-  # Default source for a prepare derivation: the workspace without any app
-  # (packages nested inside an app dir are kept), so editing an app doesn't
-  # re-run every package's prepare.
-  packagesOnlySrc = let
-    # An app entry can sit at a package's path (e.g. a per-package check);
-    # that's still a package, so keep it.
-    appDirs = filter (p: !builtins.elem p packages) (lib.unique (map (a: a.path) apps));
-    nestedPackages = filter (p: lib.any (a: lib.hasPrefix "${a}/" p) appDirs) packages;
+  # Default source for a prepare derivation: the package, everything it links
+  # to (apps included), and the workspace root's own files. Nothing else, so
+  # the derivation is the same for every caller's app list and an edit
+  # elsewhere doesn't re-run it, and with it every build that overlays it.
+  defaultPackageSrc = path: let
     existing = paths: filter builtins.pathExists (map (p: workspaceRoot + "/${p}") paths);
-    excludedApps = lib.fileset.difference
-      (lib.fileset.unions (existing appDirs))
-      (lib.fileset.unions (existing nestedPackages));
-    lockfile = lib.optional
-      (lib.hasPrefix (toString workspaceRoot) (toString pnpmLockYaml))
-      (toPath pnpmLockYaml);
-    nodeModulesDirs = existing (map (p: if p == "." then "node_modules" else "${p}/node_modules")
-      (["."] ++ packages ++ appDirs));
+    importers = lib.remove "." ([path] ++ workspaceClosureOf path);
+    lockfile = toString pnpmLockYaml;
+    rootFiles = lib.mapAttrsToList (name: _: workspaceRoot + "/${name}")
+      (filterAttrs (name: type: type == "regular" && toString (workspaceRoot + "/${name}") != lockfile)
+        (builtins.readDir workspaceRoot));
   in
     lib.fileset.toSource {
       root = workspaceRoot;
-      fileset = lib.fileset.difference workspaceRoot
-        (lib.fileset.unions ([excludedApps] ++ lockfile ++ nodeModulesDirs));
+      fileset = lib.fileset.difference
+        (lib.fileset.unions (existing importers ++ rootFiles))
+        (lib.fileset.unions (existing (map (p: "${p}/node_modules") importers)));
     };
 
+  # Packages a build's src leaves out (a deliberately filtered appSrc) stay out.
   overlayPreparedLines = paths: concatStringsSep "\n" (map (p: ''
-    cp -r "${prepared.${p}}/." "${p}/"
-    chmod -R u+w "${p}"
+    if [ -d "${p}" ]; then
+      cp -r "${prepared.${p}}/." "${p}/"
+      chmod -R u+w "${p}"
+    fi
   '') paths);
 
   prepared = listToAttrs (map (path: {
@@ -357,13 +360,21 @@
     value = mkBuild {
       name = "prepare-${lib.strings.sanitizeDerivationName path}";
       inherit path;
-      src = if packageSrc != null then packageSrc path else packagesOnlySrc;
+      src = if packageSrc != null then packageSrc path else defaultPackageSrc path;
       script = "prepare";
       overlay = preparedDepsOf path;
       installPhase = ''
         runHook preInstall
         mkdir -p $out
-        find "${path}" -mindepth 1 -maxdepth 1 ! -name node_modules -exec cp -r {} $out/ \;
+        # Only what `prepare` created or changed, so the overlay can't roll a
+        # consumer's copy of the package's own sources back.
+        (cd "${path}" && find . -name node_modules -prune -o \( -type f -o -type l \) -print) |
+          while IFS= read -r f; do
+            if [ ! -e "$src/${path}/$f" ] || ! cmp -s "${path}/$f" "$src/${path}/$f"; then
+              mkdir -p "$out/$(dirname "$f")"
+              cp -P "${path}/$f" "$out/$f"
+            fi
+          done
         runHook postInstall
       '';
     };
