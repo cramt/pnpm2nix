@@ -13,6 +13,14 @@
     in {
       lib = lib;
 
+      checks = {
+        split-irreversible-deletes = pkgs.runCommand "split-irreversible-deletes" {} ''
+          bash ${./tests/split-irreversible-deletes/run.sh} \
+            ${./lib/split-irreversible-deletes.awk} ${./tests/split-irreversible-deletes}
+          touch $out
+        '';
+      };
+
       packages = {
         # Surfaced for dev convenience: build the example workspace.
         # Run with `nix build .#example-foo` etc.

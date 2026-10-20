@@ -7,7 +7,9 @@ function flush(  i) {
     print path > delfile
   } else {
     for (i = 1; i <= n; i++) print buf[i] > keepfile
-    if (isdiff) kept = 1
+    # Hunks count too: a plain `diff -ruN` patch has no `diff --git` headers,
+    # and treating it as empty silently skipped the whole patch.
+    if (isdiff || hunks > 0) kept = 1
   }
   n = 0
   hunks = 0

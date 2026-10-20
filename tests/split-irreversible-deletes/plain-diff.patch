@@ -1,0 +1,6 @@
+diff -ruN a/lib/index.js b/lib/index.js
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,1 +1,1 @@
+-old()
++renamed()
