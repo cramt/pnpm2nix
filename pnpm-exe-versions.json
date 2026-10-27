@@ -311,6 +311,12 @@
     "linux-arm64-musl": "sha512-pNC38k+O+90FOjbPNSnw0E7apq1PKTmz3fFe1amn+lys/U5kL++uzir8bRiho8ONcyA3d9EU7wdqcY0DKkj+JA==",
     "linux-x64-musl": "sha512-A9J0Jg0Rdx+qQU4qXtwyST5tto9IOu1zi4fDk35nbc6DWahggbcKtFvZPKFwL2qgUXGXOX//hXv6z/sp6emO8A=="
   },
+  "12.16.0": {
+    "darwin-arm64": "sha512-0kMENoYlVTxiCPWf7fXEF3EtYXUySilIC+UAe5Z7kC8keY8+ul8ddhuHjSU0e85qlKDIJfIxDYACse/Lx8It/Q==",
+    "darwin-x64": "sha512-jsS6Q5gTjRD4TOyyFazO/3ctRHfigGtLatfV2ZxCGd0/ZD/m/9RIT8P38oyo+r3ARHhgL7YPT8dXmj5UGd9iSA==",
+    "linux-arm64-musl": "sha512-1p8s61byKqiaDi+TatmMoxFVFPXpLwrHBI4CZBJlH2A58hi3EfqfDgWB5w2IutciGrBQ5DxVFE8VsbITnpqfUQ==",
+    "linux-x64-musl": "sha512-BCp9UPPqS9wyZmfB1CeX8ODpUaY3icHPNQvnlutDUymexM0frPxgd1Qf1iWfC+IhvszevGnVlkUqEITSMowHNw=="
+  },
   "12.2.0": {
     "darwin-arm64": "sha512-x9ptl28DNc8ZXiuuaA0fObUIY3ieZH7uI2ovxH/EE8/GwFn4Wc2ysyGIOHTYEa3A9teKIn9T7J75Sp4TJ5+WOA==",
     "darwin-x64": "sha512-GlLm/KclJEj8MJ8xp+i685QSFD0ZlrMtUSB4veiNFP9T1Gf7P0+PToPust7CamAZ4XJJp1/pT038OCExIvlA+g==",
