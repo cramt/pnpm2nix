@@ -19,6 +19,12 @@
             ${./lib/split-irreversible-deletes.awk} ${./tests/split-irreversible-deletes}
           touch $out
         '';
+        patched-dependencies = pkgs.runCommand "patched-dependencies" {
+          nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+        } ''
+          python3 ${./tests/patched-dependencies/test_resolve.py} ${./lib/parser.py}
+          touch $out
+        '';
       };
 
       packages = {

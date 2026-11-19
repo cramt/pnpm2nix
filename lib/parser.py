@@ -231,6 +231,55 @@ def load_lockfile(lockfile_path: str) -> dict:
     return workspace_docs[0]
 
 
+def split_patch_key(patch_key: str) -> tuple[str, str | None]:
+    """'name@1.2.3' -> ('name', '1.2.3'); bare 'name' or '@scope/name' -> (name, None)."""
+    at = patch_key.rfind("@")
+    if at <= 0:
+        return patch_key, None
+    return patch_key[:at], patch_key[at + 1 :]
+
+
+def resolve_patched_dependencies(
+    patch_specs: dict[str, dict], packages: dict[str, dict]
+) -> dict[str, dict]:
+    """Expand pnpm's patchedDependencies keys onto concrete `name@version` package keys.
+
+    pnpm accepts a bare `name` (every version) as well as `name@version`, and an
+    exact key beats a bare one. extract.nix looks patches up by `name@version`,
+    so passing a bare key through would drop the patch without a word. A key we
+    can't place is fatal for the same reason: pnpm already refuses unused
+    patches, so reaching that here means we disagree with pnpm.
+    """
+    exact: dict[str, dict] = {}
+    by_name: dict[str, dict] = {}
+    for patch_key, spec in patch_specs.items():
+        name, version = split_patch_key(patch_key)
+        if version is None:
+            by_name[name] = spec
+        elif re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?", version):
+            exact[f"{name}@{version}"] = spec
+        else:
+            sys.exit(
+                f"pnpm2nix: patchedDependencies key {patch_key!r} uses a version range, "
+                "which pnpm2nix does not resolve yet; use a bare name or an exact version"
+            )
+
+    resolved: dict[str, dict] = {}
+    used: set[str] = set()
+    for pkg_key, pkg in packages.items():
+        if pkg_key in exact:
+            resolved[pkg_key] = exact[pkg_key]
+            used.add(pkg_key)
+        elif pkg["name"] in by_name:
+            resolved[pkg_key] = by_name[pkg["name"]]
+            used.add(pkg["name"])
+
+    unused = sorted((set(exact) | set(by_name)) - used)
+    if unused:
+        sys.exit(f"pnpm2nix: patchedDependencies match no locked package: {unused}")
+    return resolved
+
+
 def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
     data = load_lockfile(lockfile_path)
 
@@ -370,21 +419,20 @@ def main(lockfile_path: str, workspace_yaml_path: str | None = None) -> None:
         ws_data = yaml.safe_load(Path(workspace_yaml_path).read_text()) or {}
         workspace_patched = ws_data.get("patchedDependencies") or {}
 
-    patched_dependencies: dict[str, dict] = {}
-    for pkg_key, patch_meta in raw_patched.items():
+    patch_specs: dict[str, dict] = {}
+    for patch_key, patch_meta in raw_patched.items():
         if isinstance(patch_meta, dict):
             patch_path = patch_meta.get("path")
             patch_hash = patch_meta.get("hash", "")
         elif isinstance(patch_meta, str):
             patch_hash = patch_meta
-            patch_path = workspace_patched.get(pkg_key)
+            patch_path = workspace_patched.get(patch_key)
         else:
             continue
         if patch_path:
-            patched_dependencies[pkg_key] = {
-                "path": patch_path,
-                "hash": patch_hash,
-            }
+            patch_specs[patch_key] = {"path": patch_path, "hash": patch_hash}
+
+    patched_dependencies = resolve_patched_dependencies(patch_specs, packages)
 
     cycles = find_cycles(snapshots)
 
