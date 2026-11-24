@@ -33,8 +33,17 @@
   # scripts" below.
   prepareWorkspacePackages ? true,
   # Source for a package's prepare derivation, as `path -> src`. Defaults to
-  # the workspace minus app dirs. Mirrors `appSrc` for callers that filter.
+  # `srcFor { inherit path; }`. Mirrors `appSrc` for callers that filter.
   packageSrc ? null,
+  # Workspace-root entries (files or dirs, root-relative names) every default
+  # source includes on top of its importers. null means every regular file at
+  # the root except the lockfile. An allowlist is the safer choice for a busy
+  # repo: anything new at the root (infra, docs, CI config) then stays out of
+  # every build instead of invalidating all of them.
+  rootSrc ? null,
+  # `importerPath -> [relative path]`: what to drop from an importer's dir in
+  # every default source, e.g. deploy config or docs no script reads.
+  importerSrcExclude ? (_: []),
 }: let
   # `workspace` is commonly a flake input (`inputs.foo`) or a store-path string
   # rather than a literal `./.`. Those coerce fine in string contexts, but
@@ -119,7 +128,10 @@
   # Importers: workspace root (".") + apps + shared packages.
   # ---------------------------------------------------------------------------
 
-  importerPaths = ["."] ++ map (a: a.path) apps ++ packages;
+  # The lockfile's importers are included because a build's workspace closure
+  # can reach one the caller never listed (a package depending on an app).
+  importerPaths = lib.unique (["."] ++ map (a: a.path) apps ++ packages
+    ++ builtins.attrNames parsed.importers);
 
   importerTopLevelDeps = path: let
     e = parsed.importers.${path} or {deps = {}; devDeps = {}; optionalDeps = {};};
@@ -187,44 +199,6 @@
     fi
     ${workspaceDepLinkLines importerPath workspaceDirect}
   '';
-
-  # ---------------------------------------------------------------------------
-  # Source isolation: each app build only sees its own directory + shared
-  # packages. Touching app B doesn't invalidate app A's build cache.
-  # ---------------------------------------------------------------------------
-
-  isolatedSrc = appName: let
-    others = filter (a: a.name != appName) apps;
-    excludePaths =
-      # pnpm-lock.yaml is consumed at eval time (IFD → farm); pnpm never
-      # reads it during `pnpm run` (node_modules is pre-materialized and
-      # verify_deps_before_run is off). Excluding it from app sources means
-      # a lockfile change only rebuilds apps whose dependency closure
-      # actually changed — otherwise every app would rebuild via src.
-      # NOTE: custom `appSrc` filters should exclude it too, for the same
-      # reason. (Guarded: a lockfile outside the workspace tree can't be
-      # part of the fileset anyway.)
-      (lib.optional (lib.hasPrefix (toString workspaceRoot) (toString pnpmLockYaml)) (toPath pnpmLockYaml))
-      ++ (map (a: workspaceRoot + "/${a.path}") others)
-      # Exclude any local node_modules left in an importer directory by a dev
-      # `pnpm install`. Derived from the actual importer set (root + app +
-      # package paths) rather than hardcoded top-level dir names, so a
-      # workspace laid out under `services/` etc. isn't missed.
-      ++ (let
-        importerDirs = ["."] ++ map (a: a.path) apps ++ packages;
-        nmOf = p:
-          if p == "."
-          then workspaceRoot + "/node_modules"
-          else workspaceRoot + "/${p}/node_modules";
-      in
-        filter builtins.pathExists (map nmOf importerDirs));
-  in
-    lib.fileset.toSource {
-      root = workspaceRoot;
-      fileset = lib.fileset.difference
-        workspaceRoot
-        (lib.fileset.unions excludePaths);
-    };
 
   # ---------------------------------------------------------------------------
   # .npmrc injection: sandbox-required settings merged with caller overrides.
@@ -305,7 +279,8 @@
     else if segments == [] then "."
     else concatStringsSep "/" segments;
 
-  workspaceDepPaths = importerPath:
+  # Importer paths among `deps` (name -> lockfile key) that are workspace links.
+  workspaceLinkPaths = importerPath: deps:
     filter (p: p != null) (mapAttrsToList (depName: depKey: let
       versionPart = builtins.substring (lib.stringLength depName + 1) (-1) depKey;
       rel = lib.removePrefix "link:"
@@ -313,38 +288,91 @@
           (lib.removePrefix "workspace:" versionPart));
     in
       joinRelative importerPath rel)
-    (filterAttrs (_: k: isWorkspaceKey k) (importerTopLevelDeps importerPath)));
+    (filterAttrs (_: k: isWorkspaceKey k) deps));
 
-  # Every importer a package reaches through workspace links, itself excluded.
-  workspaceClosureOf = path:
-    filter (p: p != path) (map (c: c.key) (builtins.genericClosure {
-      startSet = map (p: {key = p;}) (workspaceDepPaths path);
-      operator = item: map (p: {key = p;}) (workspaceDepPaths item.key);
-    }));
+  # Everything the importer itself links to, devDependencies included: what a
+  # build OF this importer needs.
+  workspaceDepPaths = importerPath:
+    workspaceLinkPaths importerPath (importerTopLevelDeps importerPath);
+
+  # What the importer needs when something ELSE depends on it: npm's rule, no
+  # devDependencies. Peers count, since a workspace package resolves its peers
+  # through its own links (pnpm lists a dev+peer dep under devDependencies, so
+  # the manifest says which of those are peers). This is what keeps a
+  # type-only devDependency (a client package's dev link to the server whose
+  # types it re-exports) out of every consumer's closure.
+  runtimeDepPaths = importerPath: let
+    e = parsed.importers.${importerPath} or {deps = {}; devDeps = {}; optionalDeps = {};};
+    peers = builtins.attrNames ((readManifest importerPath).peerDependencies or {});
+  in
+    workspaceLinkPaths importerPath
+    (e.deps // e.optionalDeps // filterAttrs (name: _: builtins.elem name peers) e.devDeps);
+
+  # Importers physically inside another importer's dir (a package nested in an
+  # app). A source holding the outer dir holds the inner one too, and a script
+  # there may drive it (`pnpm --filter <nested> build`), so it gets set up.
+  nestedIn = path:
+    filter (p: p != "." && lib.hasPrefix (path + "/") p) importerPaths;
+
+  # Every importer a build needs, to a fixpoint. The given importers are built
+  # here, so they bring all their deps (workspaceDepPaths); what they reach
+  # brings only its runtimeDepPaths. An importer nested in one that's present
+  # is in the source anyway and a script may build it, so it counts as built
+  # here too. Sorted so the order — and with it every derivation built from
+  # it — doesn't depend on the order the caller listed things in.
+  importersFor = paths: let
+    built = p: {key = "built:${p}"; path = p; built = true;};
+    reached = p: {key = "reached:${p}"; path = p; built = false;};
+  in
+    lib.sort lib.lessThan (lib.remove "." (lib.unique (map (c: c.path)
+      (builtins.genericClosure {
+        startSet = map built paths;
+        operator = item:
+          map reached ((if item.built then workspaceDepPaths else runtimeDepPaths) item.path)
+          ++ map built (nestedIn item.path);
+      }))));
 
   # Prepared packages a package's own `prepare` needs first: the prepared ones
   # among its transitive workspace deps. A cycle between two packages that both
   # have `prepare` can't be ordered (pnpm can't either) and recurses at eval.
   preparedDepsOf = path:
-    filter (p: builtins.elem p preparedPaths) (workspaceClosureOf path);
+    filter (p: p != path && builtins.elem p preparedPaths) (importersFor [path]);
 
-  # Default source for a prepare derivation: the package, everything it links
-  # to (apps included), and the workspace root's own files. Nothing else, so
-  # the derivation is the same for every caller's app list and an edit
-  # elsewhere doesn't re-run it, and with it every build that overlays it.
-  defaultPackageSrc = path: let
-    existing = paths: filter builtins.pathExists (map (p: workspaceRoot + "/${p}") paths);
-    importers = lib.remove "." ([path] ++ workspaceClosureOf path);
-    lockfile = toString pnpmLockYaml;
-    rootFiles = lib.mapAttrsToList (name: _: workspaceRoot + "/${name}")
+  rootEntries =
+    if rootSrc != null
+    then map (n: workspaceRoot + "/${n}") rootSrc
+    else let
+      # pnpm-lock.yaml is consumed at eval time (IFD → farm); pnpm never reads
+      # it during `pnpm run`. Leaving it out means a lockfile change only
+      # rebuilds what its dependency closure actually changed.
+      lockfile = toString pnpmLockYaml;
+    in
+      lib.mapAttrsToList (name: _: workspaceRoot + "/${name}")
       (filterAttrs (name: type: type == "regular" && toString (workspaceRoot + "/${name}") != lockfile)
         (builtins.readDir workspaceRoot));
+
+  # Source for building `path`: its importer closure (see importersFor), the
+  # root entries and `include`, minus each importer's node_modules and
+  # importerSrcExclude, minus `exclude`. `include`/`exclude` are root-relative.
+  # Nothing outside the closure, so an edit to an unrelated app or package
+  # leaves the build, and its hash, untouched.
+  srcFor = {
+    path,
+    extraImporters ? [],
+    include ? [],
+    exclude ? [],
+  }: let
+    importers = importersFor ([path] ++ extraImporters);
+    existing = paths: filter builtins.pathExists (map (p:
+      if p == "." then workspaceRoot else workspaceRoot + "/${p}") paths);
+    dropped = lib.concatMap (p: map (rel: "${p}/${rel}") (["node_modules"] ++ importerSrcExclude p)) importers
+      ++ exclude;
   in
     lib.fileset.toSource {
       root = workspaceRoot;
       fileset = lib.fileset.difference
-        (lib.fileset.unions (existing importers ++ rootFiles))
-        (lib.fileset.unions (existing (map (p: "${p}/node_modules") importers)));
+        (lib.fileset.unions (existing (importers ++ include) ++ filter builtins.pathExists rootEntries))
+        (lib.fileset.unions (existing dropped));
     };
 
   # Packages a build's src leaves out (a deliberately filtered appSrc) stay out.
@@ -360,7 +388,7 @@
     value = mkBuild {
       name = "prepare-${lib.strings.sanitizeDerivationName path}";
       inherit path;
-      src = if packageSrc != null then packageSrc path else defaultPackageSrc path;
+      src = if packageSrc != null then packageSrc path else srcFor {inherit path;};
       script = "prepare";
       overlay = preparedDepsOf path;
       installPhase = ''
@@ -389,13 +417,19 @@
   in mkBuild {
     inherit (app) name path;
     version = app.version or "0.0.0";
-    src = if appSrc != null then appSrc app.name else isolatedSrc app.name;
+    src =
+      if appSrc != null
+      then appSrc app.name
+      else srcFor {inherit (app) path; extraImporters = app.extraImporters or [];};
     script = app.script or "build";
     extraImporters = app.extraImporters or [];
     buildEnv = app.buildEnv or {};
     extraNativeBuildInputs = app.extraNativeBuildInputs or [];
     preBuildPackages = app.preBuildPackages or [];
-    overlay = preparedPaths;
+    # Only the prepared packages this app reaches, so another package's
+    # `prepare` output changing doesn't touch this derivation.
+    overlay = filter (p: builtins.elem p preparedPaths)
+      (importersFor ([app.path] ++ (app.extraImporters or [])));
     installPhase = ''
       runHook preInstall
       mkdir -p $out
@@ -418,7 +452,10 @@
     # generated types. Their dirs must also be present in the app's `src`.
     app = build;
     extraImporters = build.extraImporters or [];
-    appComponents = lib.unique (["."] ++ packages ++ [app.path] ++ extraImporters);
+    # Only the importers this build reaches. Setting up every package used to
+    # tie each build to every importer's node_modules (and the hoist compose
+    # over all of them), so a dep bump in one package rebuilt everything.
+    appComponents = ["."] ++ importersFor ([app.path] ++ extraImporters);
     setupAll = concatStringsSep "\n" (map importerSetupLines appComponents);
 
     # Hoist fallback target for this build (see farm.nix header): a compose
@@ -515,6 +552,9 @@ in {
     value = mkApp a;
   }) apps);
   nodeModules = importerNodeModules;
+  # The default source and importer set of a build of `path`, for callers whose
+  # `appSrc`/`packageSrc` overlay or trim it rather than start from scratch.
+  inherit srcFor importersFor;
   # One derivation per workspace package with a `prepare` script, keyed by
   # path; its output is the prepared package dir (node_modules excluded).
   inherit prepared;

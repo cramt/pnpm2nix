@@ -138,13 +138,16 @@ Node's walk-up from `<cell>/<enc>/node_modules/<pkg>/…` consults
 `<cell>/node_modules/` right after the snapshot's declared deps. Inside an
 app build sandbox, `workspace.nix` materializes `/build/.p2n-hoist` as a
 symlink to that app's hoist compose (`.pnpm/node_modules/` over everything
-reachable from every importer set up in the sandbox).
+reachable from every importer set up in the sandbox, i.e. the build's
+workspace closure; see "Closure scoping" below).
 
 Properties:
 - The link contains **no store path**, so cells stay byte-identical across
   lockfile changes — no rebuild cascade through the fallback.
 - Each app resolves hoisted names against its own closure — pnpm's
-  global-hoist semantics, scoped per app.
+  global-hoist semantics, scoped per app. A phantom dependency that only
+  resolved because an unrelated workspace package declared it now fails
+  the build instead of passing by accident; declare it.
 - Outside a sandbox the link dangles, which means "no hoist" — the same as
   pnpm with hoisting disabled.
 - Assumes the standard sandbox build dir `/build` (Nix's default
@@ -171,19 +174,30 @@ symlinks to the source tree during the app build, not here.
 
 Each app's `stdenv.mkDerivation`:
 
-1. **Source isolation**: `lib.fileset.difference` excludes other apps'
-   directories from the source tree — touching app B doesn't invalidate
-   app A's build — and `pnpm-lock.yaml` itself, which is consumed at eval
-   time only. Without that exclusion every lockfile change would rebuild
-   every app through `src`, defeating per-app dependency caching. Custom
-   `appSrc` filters must exclude the lockfile themselves to get the same
-   benefit.
+1. **Closure scoping**: `importersFor` computes the build's workspace
+   closure: the built importer with all its `workspace:` links, then the
+   runtime links (`dependencies`, `optionalDependencies`, and devDeps the
+   manifest also lists as `peerDependencies`) of everything reached, plus
+   any importer nested inside one already present, which counts as built
+   (it's in the source, and a script may `pnpm --filter` it). npm's rule:
+   a dependency's devDependencies are its own business, which keeps a
+   type-only dev link (a client package's link to the server it takes
+   types from) out of every consumer.
+
+   `srcFor` turns that set into the source: the closure's directories plus
+   `rootSrc` (default: the root's regular files), minus node_modules and
+   `importerSrcExclude`. `pnpm-lock.yaml` stays out by default since it's
+   consumed at eval time only; otherwise every lockfile change would
+   rebuild every app through `src`. The importer setup, hoist compose and
+   prepared overlays below use the same set, so nothing outside the
+   closure is a build input at all. Callers with a custom `appSrc` get
+   `srcFor`/`importersFor` back to trim or overlay rather than start over.
 
 2. **Configure phase**:
    - Points `/build/.p2n-hoist` at the app's hoist compose
    - Injects `.npmrc` with sandbox-required settings
    - Lays each prepared workspace package (see below) over its source dir
-   - For each importer (root + packages + this app):
+   - For each importer (root + the closure):
      - `cp -aT` the importer node_modules (copies symlinks, not data)
      - Creates workspace dep symlinks (relative to source tree)
 
@@ -196,8 +210,8 @@ Each app's `stdenv.mkDerivation`:
 `pnpm install` runs the `prepare` script of every workspace package, so its
 gitignored output (a types build in `dist/`, generated code) is part of the
 tree consumers resolve against locally. Each shared package with a `prepare`
-gets its own derivation built with the same flow as an app: source is the
-workspace minus app dirs (override with `packageSrc`), the prepared outputs
+gets its own derivation built with the same flow as an app: source is its
+own closure (override with `packageSrc`), the prepared outputs
 of its own workspace deps are laid in first, and `$out` is the package dir
 after `prepare`, `node_modules` excluded. App builds copy every prepared
 package over its source in the configure phase.

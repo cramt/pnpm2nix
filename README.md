@@ -23,8 +23,13 @@ primitives (`fetchurl`, `runCommand`, hardlinks, symlinks).
   app, pruned to that app's dependency closure. Bumping a dep rebuilds
   the affected cells and the apps whose closure actually changed —
   nothing else.
-- **Source isolation.** Each app build only sees its own source tree.
-  Touching app B doesn't invalidate app A's cache.
+- **Closure-scoped builds.** Each build sees only its workspace closure:
+  its own importer with all its `workspace:` deps, the runtime deps
+  (`dependencies`, `optionalDependencies`, `peerDependencies`; not
+  `devDependencies`) of those, and importers nested inside any of them.
+  Its source, node_modules setup, hoist farm and prepared-package overlays
+  are all scoped to that set, so touching app B or package C never
+  invalidates a build that doesn't depend on it.
 - **Workspace `prepare` scripts.** Shared packages' `prepare` (a types
   build, codegen) runs once per package and every app builds against the
   prepared tree, as after a local `pnpm install`.
@@ -157,7 +162,15 @@ pnpm2nix.mkPnpmWorkspace {
   prepareWorkspacePackages = true;   # Run shared packages' `prepare` scripts,
                                      # as `pnpm install` does (see below)
   packageSrc = null;                 # path -> src for those prepare builds
-                                     # (default: workspace minus app dirs)
+                                     # (default: srcFor { inherit path; })
+  appSrc = null;                     # appName -> src (default: srcFor of the
+                                     # app's path + extraImporters)
+  rootSrc = null;                    # root-relative entries every default src
+                                     # includes; null = every regular root file
+                                     # but the lockfile. An allowlist keeps new
+                                     # root dirs out of every build.
+  importerSrcExclude = _: [];        # importerPath -> [relative path] dropped
+                                     # from that importer in every default src
 }
 ```
 
@@ -175,6 +188,10 @@ pnpm2nix.mkPnpmWorkspace {
   prepared = {
     "packages/my-lib" = <derivation>; # Package dir after `prepare`
   };
+  # Building blocks for a custom appSrc/packageSrc that trims or overlays the
+  # default rather than starting over:
+  importersFor = [ "apps/my-app" ] -> [ "apps/my-app" "packages/ui" ... ];
+  srcFor = { path, extraImporters ? [], include ? [], exclude ? [] } -> <source>;
   pnpmStore = <derivation>;  # Full compose farm over every snapshot
   pnpm = <derivation>;       # The pnpm used to build this workspace
                              # (handy for `nix run` utility scripts)
